@@ -18,7 +18,9 @@ import (
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/changemanager"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/clonemanager"
+	"github.com/go-git/go-billy/v5/memfs"
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/google/go-github/v84/github"
 	"github.com/sethvargo/go-envconfig"
 )
@@ -97,6 +99,10 @@ func TestEnvDecode(t *testing.T) {
 		val:  "  review  ",
 		want: ModeReview,
 	}, {
+		name: "config",
+		val:  "config",
+		want: ModeConfig,
+	}, {
 		name:    "unknown value",
 		val:     "bogus",
 		wantErr: true,
@@ -146,6 +152,9 @@ func TestModeString(t *testing.T) {
 		mode: ModeAll,
 		want: "all",
 	}, {
+		mode: ModeConfig,
+		want: "config",
+	}, {
 		mode: Mode(99),
 		want: "unknown(99)",
 	}}
@@ -176,6 +185,10 @@ func TestWithMode(t *testing.T) {
 		name: "all",
 		mode: ModeAll,
 		want: ModeAll,
+	}, {
+		name: "config",
+		mode: ModeConfig,
+		want: ModeConfig,
 	}}
 
 	for _, tt := range tests {
@@ -267,6 +280,136 @@ func TestReconcileReviewOnlySkipsPath(t *testing.T) {
 	}, nil)
 	if err != nil {
 		t.Fatalf("Reconcile: got = %v, wanted = nil", err)
+	}
+}
+
+func TestReconcileNoneModeSkipsPath(t *testing.T) {
+	rec := &Reconciler[*testRequest, *testResult, testCallbacks]{
+		identity: "test-identity",
+		mode:     ModeNone,
+	}
+
+	err := rec.Reconcile(t.Context(), &githubreconciler.Resource{
+		Type:  githubreconciler.ResourceTypePath,
+		Owner: "owner",
+		Repo:  "repo",
+	}, nil)
+	if err != nil {
+		t.Fatalf("Reconcile: got = %v, wanted = nil", err)
+	}
+}
+
+func TestIsConfig(t *testing.T) {
+	tests := []struct {
+		mode Mode
+		want bool
+	}{{
+		mode: ModeConfig,
+		want: true,
+	}, {
+		mode: ModeFix,
+		want: false,
+	}, {
+		mode: ModeReview,
+		want: false,
+	}, {
+		mode: ModeAll,
+		want: false,
+	}, {
+		mode: ModeNone,
+		want: false,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.mode.String(), func(t *testing.T) {
+			if got := tt.mode.IsConfig(); got != tt.want {
+				t.Errorf("IsConfig: got = %v, wanted = %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func newTestWorktree(t *testing.T) *gogit.Worktree {
+	t.Helper()
+	repo, err := gogit.Init(memory.NewStorage(), memfs.New())
+	if err != nil {
+		t.Fatalf("init test repo: %v", err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("get test worktree: %v", err)
+	}
+	return wt
+}
+
+func TestLoadRepoConfig(t *testing.T) {
+	const identity = "test-bot"
+	configPath := "." + identity + ".yaml"
+
+	tests := []struct {
+		name     string
+		content  string // empty means no file
+		wantMode Mode
+		wantErr  bool
+	}{{
+		name:     "no file",
+		content:  "",
+		wantMode: ModeNone,
+	}, {
+		name:     "empty file",
+		content:  "{}\n",
+		wantMode: ModeFix,
+	}, {
+		name:     "mode fix",
+		content:  "mode: fix\n",
+		wantMode: ModeFix,
+	}, {
+		name:     "mode review",
+		content:  "mode: review\n",
+		wantMode: ModeReview,
+	}, {
+		name:     "mode all",
+		content:  "mode: all\n",
+		wantMode: ModeAll,
+	}, {
+		name:     "mode none",
+		content:  "mode: none\n",
+		wantMode: ModeNone,
+	}, {
+		name:    "invalid mode",
+		content: "mode: bogus\n",
+		wantErr: true,
+	}}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wt := newTestWorktree(t)
+
+			if tt.content != "" {
+				f, err := wt.Filesystem.Create(configPath)
+				if err != nil {
+					t.Fatalf("create config: %v", err)
+				}
+				if _, err := fmt.Fprint(f, tt.content); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+				f.Close()
+			}
+
+			m, err := loadRepoConfig(wt, identity)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("loadRepoConfig: got = nil, wanted error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("loadRepoConfig: got = %v, wanted = nil", err)
+			}
+			if m != tt.wantMode {
+				t.Errorf("mode: got = %q, wanted = %q", m, tt.wantMode)
+			}
+		})
 	}
 }
 

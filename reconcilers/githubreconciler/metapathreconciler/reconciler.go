@@ -31,6 +31,9 @@ const (
 	ModeFix Mode = 1 << iota
 	// ModeReview reviews other PRs.
 	ModeReview
+	// ModeConfig delegates all behavior decisions to the per-repo
+	// .github/chainguard/{identity}.yaml config file.
+	ModeConfig
 	// ModeNone disables all behaviors.
 	ModeNone Mode = 0
 	// ModeAll handles paths, own PRs, and reviews other PRs.
@@ -38,7 +41,7 @@ const (
 )
 
 // EnvDecode implements github.com/sethvargo/go-envconfig.Decoder so Mode
-// can be used directly in envconfig structs. Valid values: fix, review, all, none.
+// can be used directly in envconfig structs. Valid values: fix, review, all, none, config.
 func (m *Mode) EnvDecode(val string) error {
 	switch strings.TrimSpace(strings.ToLower(val)) {
 	case "fix":
@@ -49,6 +52,8 @@ func (m *Mode) EnvDecode(val string) error {
 		*m = ModeAll
 	case "none":
 		*m = ModeNone
+	case "config":
+		*m = ModeConfig
 	default:
 		return fmt.Errorf("unknown mode %q", val)
 	}
@@ -64,6 +69,8 @@ func (m Mode) String() string {
 		return "fix"
 	case ModeReview:
 		return "review"
+	case ModeConfig:
+		return "config"
 	case ModeNone:
 		return "none"
 	default:
@@ -76,6 +83,9 @@ func (m Mode) ShouldFix() bool { return m&ModeFix != 0 }
 
 // ShouldReview reports whether m includes review behavior.
 func (m Mode) ShouldReview() bool { return m&ModeReview != 0 }
+
+// IsConfig reports whether m delegates behavior to the per-repo config file.
+func (m Mode) IsConfig() bool { return m&ModeConfig != 0 }
 
 // Reconciler is a generic reconciler for metaagent-based path handlers.
 type Reconciler[Req promptbuilder.Bindable, Resp Result, CB any] struct {
@@ -138,7 +148,7 @@ func New[Req promptbuilder.Bindable, Resp Result, CB any](
 	buildCallbacks func(context.Context, *changemanager.Session[PRData[Req]], *clonemanager.Lease) (CB, error),
 	opts ...Option,
 ) (*Reconciler[Req, Resp, CB], error) {
-	o := option{mode: ModeAll}
+	o := option{mode: ModeConfig}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -172,7 +182,7 @@ func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, res *githubre
 
 	switch res.Type {
 	case githubreconciler.ResourceTypePath:
-		if !r.mode.ShouldFix() {
+		if !r.mode.ShouldFix() && !r.mode.IsConfig() {
 			return nil
 		}
 		return r.reconcilePath(ctx, res, gh)

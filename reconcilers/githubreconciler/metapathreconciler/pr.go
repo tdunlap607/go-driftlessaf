@@ -90,7 +90,7 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePullRequest(ctx context.Context, re
 	}
 
 	// Case 3: Other PR → run analyzer on changed files.
-	if !r.mode.ShouldReview() {
+	if !r.mode.ShouldReview() && !r.mode.IsConfig() {
 		if !neutralAtHead {
 			return session.SetActualState(ctx, "Skipped (fix-only)", &statusmanager.Status[CheckDetails]{
 				Status:     "completed",
@@ -142,6 +142,22 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePullRequest(ctx context.Context, re
 	wt, err := lease.Repo().Worktree()
 	if err != nil {
 		return fmt.Errorf("get worktree: %w", err)
+	}
+
+	if r.mode.IsConfig() {
+		m, err := loadRepoConfig(wt, r.identity)
+		if err != nil {
+			return fmt.Errorf("load repo config: %w", err)
+		}
+		if !m.ShouldReview() {
+			if !neutralAtHead {
+				return session.SetActualState(ctx, "Skipped (config)", &statusmanager.Status[CheckDetails]{
+					Status:     "completed",
+					Conclusion: "neutral",
+				})
+			}
+			return nil
+		}
 	}
 
 	// Run analyzer on the changed files, then filter diagnostics to only

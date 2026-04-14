@@ -107,6 +107,17 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePath(ctx context.Context, res *gith
 		return fmt.Errorf("get worktree: %w", err)
 	}
 
+	if r.mode.IsConfig() {
+		m, err := loadRepoConfig(wt, r.identity)
+		if err != nil {
+			return fmt.Errorf("load repo config: %w", err)
+		}
+		if !m.ShouldFix() {
+			log.With("repo_mode", m).Info("Repo config disables fix, skipping")
+			return nil
+		}
+	}
+
 	// Build findings for the agent. On the first pass (no PR or needs rebase),
 	// run the analyzer and feed diagnostics. On subsequent passes (CI failures),
 	// only feed CI check findings. Mixing the two can cause conflicts (e.g.
