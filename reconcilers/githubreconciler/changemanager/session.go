@@ -22,6 +22,7 @@ import (
 	"github.com/chainguard-dev/clog"
 	"github.com/google/go-github/v84/github"
 	"github.com/shurcooL/githubv4"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // State is a bit-field representing the composite state of a PR.
@@ -405,6 +406,11 @@ func (s *Session[T]) Upsert(
 	body, err = s.manager.templateExecutor.Embed(body, data)
 	if err != nil {
 		return "", fmt.Errorf("embedding data: %w", err)
+	}
+
+	// Append trace ID so developers can map this PR back to the agent trace.
+	if spanCtx := trace.SpanFromContext(ctx).SpanContext(); spanCtx.IsValid() {
+		body += fmt.Sprintf("\n\nTrace-ID: %s", spanCtx.TraceID().String())
 	}
 
 	if s.prNumber == 0 {
