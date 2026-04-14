@@ -6,11 +6,15 @@ SPDX-License-Identifier: Apache-2.0
 package googleexecutor
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
+	"sync"
+	"time"
 
 	"chainguard.dev/driftlessaf/agents/agenttrace"
 	"chainguard.dev/driftlessaf/agents/executor/retry"
@@ -52,6 +56,24 @@ type executor[Request promptbuilder.Bindable, Response any] struct {
 	genaiMetrics       *metrics.GenAI                // OpenTelemetry metrics for token usage and tool calls
 	retryConfig        retry.RetryConfig             // retry configuration for transient Vertex AI errors
 	resourceLabels     map[string]string             // resource labels for GCP billing attribution
+
+	// cacheControl enables Vertex AI context caching. When true, the executor
+	// creates a CachedContent resource containing system instructions and tool
+	// definitions, then references it in GenerateContentConfig instead of setting
+	// SystemInstruction and Tools directly. Cached tokens are served at reduced
+	// cost with a configurable TTL.
+	// Enabled by default — disable with WithoutCacheControl() if needed.
+	// See: https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview
+	cacheControl bool
+
+	// cacheTTL is the time-to-live for cached content resources.
+	// Default: 30 minutes. Can be overridden via WithCacheTTL().
+	cacheTTL time.Duration
+
+	// cacheMu protects all cache-related mutable state below.
+	cacheMu             sync.Mutex
+	cachedContentName   string    // resource name of active CachedContent ("" = none)
+	cachedContentExpiry time.Time // when the current cache expires
 }
 
 // New creates a new Google AI executor with the given configuration
@@ -78,6 +100,8 @@ func New[Request promptbuilder.Bindable, Response any](
 		maxTurns:        DefaultMaxTurns,    // Default max conversation turns
 		genaiMetrics:    genaiMetrics,
 		retryConfig:     retry.DefaultRetryConfig(), // Default retry config for rate limit handling
+		cacheControl:    true,                       // Context caching on by default — see cacheControl field comment
+		cacheTTL:        30 * time.Minute,           // Default cache TTL
 	}
 
 	// Apply options
@@ -142,10 +166,20 @@ func (e *executor[Request, Response]) Execute(
 		tools = mergedTools
 	}
 
+	// Build tool definitions, sorted by name for deterministic ordering.
+	//
+	// Why sort? Vertex AI context caching hashes the cached content (system
+	// instructions + tools). Go maps iterate in non-deterministic order, so
+	// without sorting, the tool definitions could serialize differently on each
+	// call — producing different cache content even though the tools haven't
+	// changed. Sorting by name ensures stable content across calls.
 	toolDeclarations := make([]*genai.FunctionDeclaration, 0, len(tools))
 	for _, meta := range tools {
 		toolDeclarations = append(toolDeclarations, meta.Definition)
 	}
+	slices.SortFunc(toolDeclarations, func(a, b *genai.FunctionDeclaration) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
 
 	// Create generation config
 	config := &genai.GenerateContentConfig{
@@ -154,24 +188,46 @@ func (e *executor[Request, Response]) Execute(
 		Labels:          e.resourceLabels,
 	}
 
-	// Add system instructions if provided
+	// Build system instruction content
+	var systemInstruction *genai.Content
 	if e.systemInstructions != nil {
 		systemPrompt, err := e.systemInstructions.Build()
 		if err != nil {
 			return resp, fmt.Errorf("building system prompt: %w", err)
 		}
-		config.SystemInstruction = &genai.Content{
-			Parts: []*genai.Part{{
-				Text: systemPrompt,
-			}},
+		systemInstruction = &genai.Content{
+			Parts: []*genai.Part{{Text: systemPrompt}},
 		}
 	}
 
-	// Add tools if provided
+	// Build tools
+	var genaiTools []*genai.Tool
 	if len(toolDeclarations) > 0 {
-		config.Tools = []*genai.Tool{{
-			FunctionDeclarations: toolDeclarations,
-		}}
+		genaiTools = []*genai.Tool{{FunctionDeclarations: toolDeclarations}}
+	}
+
+	// Attempt to use cached content for system instructions + tools.
+	// When using CachedContent, SystemInstruction and Tools MUST NOT be set
+	// on GenerateContentConfig — they are already in the cache.
+	usedCache := false
+	if e.cacheControl && (systemInstruction != nil || len(genaiTools) > 0) {
+		cacheName, err := e.getOrCreateCache(ctx, systemInstruction, genaiTools)
+		if err != nil {
+			clog.WarnContext(ctx, "Failed to create cached content, falling back to non-cached mode", "error", err)
+		} else {
+			config.CachedContent = cacheName
+			usedCache = true
+		}
+	}
+
+	// Fall back to inline system instruction and tools if not using cache.
+	if !usedCache {
+		if systemInstruction != nil {
+			config.SystemInstruction = systemInstruction
+		}
+		if len(genaiTools) > 0 {
+			config.Tools = genaiTools
+		}
 	}
 
 	// Add response MIME type if provided
@@ -272,7 +328,7 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	if response != nil && response.UsageMetadata != nil {
-		e.recordTokenMetrics(ctx, response.UsageMetadata)
+		e.recordTokenMetrics(ctx, trace, response.UsageMetadata)
 		// Also record on trace span for easy viewing in Cloud Trace
 		trace.RecordTokenUsage(e.model, int64(response.UsageMetadata.PromptTokenCount), int64(response.UsageMetadata.CandidatesTokenCount))
 	}
@@ -314,7 +370,7 @@ func (e *executor[Request, Response]) Execute(
 
 			// Record metrics for retry call
 			if retryResp != nil && retryResp.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, retryResp.UsageMetadata)
+				e.recordTokenMetrics(ctx, trace, retryResp.UsageMetadata)
 				// Also record on trace span for easy viewing in Cloud Trace
 				trace.RecordTokenUsage(e.model, int64(retryResp.UsageMetadata.PromptTokenCount), int64(retryResp.UsageMetadata.CandidatesTokenCount))
 			}
@@ -415,7 +471,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			if response != nil && response.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, response.UsageMetadata)
+				e.recordTokenMetrics(ctx, trace, response.UsageMetadata)
 				// Also record on trace span for easy viewing in Cloud Trace
 				trace.RecordTokenUsage(e.model, int64(response.UsageMetadata.PromptTokenCount), int64(response.UsageMetadata.CandidatesTokenCount))
 			}
@@ -442,7 +498,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			if redirectResp != nil && redirectResp.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, redirectResp.UsageMetadata)
+				e.recordTokenMetrics(ctx, trace, redirectResp.UsageMetadata)
 				trace.RecordTokenUsage(e.model, int64(redirectResp.UsageMetadata.PromptTokenCount), int64(redirectResp.UsageMetadata.CandidatesTokenCount))
 			}
 
@@ -472,6 +528,51 @@ func (e *executor[Request, Response]) Execute(
 	return resp, fmt.Errorf("agent exceeded maximum conversation turns (%d)", e.maxTurns)
 }
 
+// getOrCreateCache returns the name of a valid CachedContent, creating one if
+// needed. It is safe for concurrent use. On cache creation it records
+// cache_creation metrics so the cost of the write is visible in dashboards.
+func (e *executor[Request, Response]) getOrCreateCache(ctx context.Context, systemInstruction *genai.Content, tools []*genai.Tool) (string, error) {
+	e.cacheMu.Lock()
+	defer e.cacheMu.Unlock()
+
+	// Cache validity is TTL-only — tool set changes between calls are not detected.
+	// Callers must ensure a stable tool set for the lifetime of this executor;
+	// use WithoutCacheControl() if the tool set varies per call.
+	if e.cachedContentName != "" && time.Now().Add(time.Minute).Before(e.cachedContentExpiry) {
+		return e.cachedContentName, nil
+	}
+
+	cached, err := e.client.Caches.Create(ctx, e.model, &genai.CreateCachedContentConfig{
+		SystemInstruction: systemInstruction,
+		Tools:             tools,
+		TTL:               e.cacheTTL,
+		DisplayName:       fmt.Sprintf("driftlessaf-%s", e.model),
+	})
+	if err != nil {
+		return "", fmt.Errorf("creating cached content: %w", err)
+	}
+
+	e.cachedContentName = cached.Name
+	e.cachedContentExpiry = cached.ExpireTime
+
+	// Record cache creation metrics and log.
+	var totalTokenCount int32
+	if cached.UsageMetadata != nil {
+		totalTokenCount = cached.UsageMetadata.TotalTokenCount
+		if totalTokenCount > 0 {
+			e.recordCacheMetrics(ctx, 0, int64(totalTokenCount))
+		}
+	}
+
+	clog.InfoContext(ctx, "Created context cache",
+		"cache_name", cached.Name,
+		"expire_time", cached.ExpireTime,
+		"total_token_count", totalTokenCount,
+	)
+
+	return cached.Name, nil
+}
+
 // ptr is a helper function to create a pointer to a value
 func ptr[T any](v T) *T {
 	return &v
@@ -489,8 +590,10 @@ func (e *executor[Request, Response]) resourceLabelsToAttributes() []attribute.K
 	return attrs
 }
 
-// recordTokenMetrics records token usage with optional enrichment
-func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, usage *genai.GenerateContentResponseUsageMetadata) {
+// recordTokenMetrics records token usage with optional enrichment.
+// When context caching is active and the response includes cached tokens,
+// cache metrics are also recorded.
+func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, trace *agenttrace.Trace[Response], usage *genai.GenerateContentResponseUsageMetadata) {
 	if usage == nil {
 		return
 	}
@@ -498,6 +601,21 @@ func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, us
 	attrs := e.resourceLabelsToAttributes()
 	attrs = append(attrs, attribute.String("gen_ai.provider.name", "gcp.vertex_ai"))
 	e.genaiMetrics.RecordTokens(ctx, e.model, int64(usage.PromptTokenCount), int64(usage.CandidatesTokenCount), attrs...)
+
+	// Record context cache metrics if caching is active.
+	if e.cacheControl && usage.CachedContentTokenCount > 0 {
+		e.recordCacheMetrics(ctx, int64(usage.CachedContentTokenCount), 0)
+		trace.RecordCacheTokenUsage(int64(usage.CachedContentTokenCount), 0)
+		clog.InfoContext(ctx, "Prompt cache metrics",
+			"cache_read_tokens", usage.CachedContentTokenCount)
+	}
+}
+
+// recordCacheMetrics records context cache token usage with optional enrichment.
+func (e *executor[Request, Response]) recordCacheMetrics(ctx context.Context, cacheRead, cacheCreation int64) {
+	attrs := e.resourceLabelsToAttributes()
+	attrs = append(attrs, attribute.String("gen_ai.provider.name", "gcp.vertex_ai"))
+	e.genaiMetrics.RecordCacheTokens(ctx, e.model, cacheRead, cacheCreation, attrs...)
 }
 
 // recordToolCall records a tool call metric with optional enrichment

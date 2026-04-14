@@ -11,6 +11,7 @@ import (
 	"maps"
 	"os"
 	"strings"
+	"time"
 
 	"chainguard.dev/driftlessaf/agents/executor/retry"
 	"chainguard.dev/driftlessaf/agents/promptbuilder"
@@ -162,6 +163,36 @@ func WithRetryConfig[Request promptbuilder.Bindable, Response any](cfg retry.Ret
 			return err
 		}
 		e.retryConfig = cfg
+		return nil
+	}
+}
+
+// WithoutCacheControl disables Vertex AI context caching.
+//
+// Context caching is enabled by default because it significantly reduces input
+// token costs for multi-turn agentic workflows. The API caches the system
+// instructions and tool definitions in a CachedContent resource, serving cached
+// tokens at reduced cost. The cache has a configurable TTL (default 30 minutes).
+//
+// You would only disable this if you have a single-turn agent with a very short
+// tool/system prompt that doesn't benefit from caching, or for debugging.
+// See: https://cloud.google.com/vertex-ai/generative-ai/docs/context-cache/context-cache-overview
+func WithoutCacheControl[Request promptbuilder.Bindable, Response any]() Option[Request, Response] {
+	return func(e *executor[Request, Response]) error {
+		e.cacheControl = false
+		return nil
+	}
+}
+
+// WithCacheTTL sets the TTL for Vertex AI cached content resources.
+// Default is 30 minutes. Minimum is 1 minute.
+// For long-running agents that make many turns, consider a longer TTL.
+func WithCacheTTL[Request promptbuilder.Bindable, Response any](ttl time.Duration) Option[Request, Response] {
+	return func(e *executor[Request, Response]) error {
+		if ttl < time.Minute {
+			return fmt.Errorf("cache TTL must be at least 1 minute, got %v", ttl)
+		}
+		e.cacheTTL = ttl
 		return nil
 	}
 }
