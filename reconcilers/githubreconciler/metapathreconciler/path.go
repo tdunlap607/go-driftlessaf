@@ -33,7 +33,11 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePath(ctx context.Context, res *gith
 	var usePRBranch bool
 	switch {
 	case session.ShouldSkip():
-		log.Info("PR should be skipped, not updating")
+		if session.HasSkipLabel() {
+			log.With("pr", session.PRNumber()).Info("PR has skip label, not updating to preserve manual changes")
+		} else {
+			log.With("pr", session.PRNumber(), "assignees", session.Assignees()).Info("PR is assigned to humans, not updating to avoid stomping their work")
+		}
 		return nil
 
 	// If the PR is not mergeable, ignore everything about the existing PR

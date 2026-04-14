@@ -41,7 +41,11 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, res *git
 	var usePRBranch bool
 	switch {
 	case changeSession.ShouldSkip(creator):
-		log.Info("PR should be skipped, not updating")
+		if changeSession.HasSkipLabel() {
+			log.With("pr", changeSession.PRNumber()).Info("PR has skip label, not updating to preserve manual changes")
+		} else {
+			log.With("pr", changeSession.PRNumber(), "assignees", changeSession.Assignees()).Info("PR is assigned to humans, not updating to avoid stomping their work")
+		}
 		return nil
 
 	case r.requiredLabel != "" && !hasLabel(issue, r.requiredLabel):
