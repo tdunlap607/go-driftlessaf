@@ -336,10 +336,26 @@ func (e *executor[Request, Response]) Execute(
 	// Handle the conversation loop with bounded turns to prevent runaway executions.
 	var responseText string
 	for turn := 0; turn < e.maxTurns; turn++ {
+		llmTurn := trace.BeginTurn(turn, e.model)
+
+		// Record tokens for the response being processed in this turn.
+		// Unlike claude/openai executors (which record tokens right after
+		// each API call), the Google SDK loop processes the *previous*
+		// iteration's response at the top of the next turn — so for turn 0
+		// this captures the initial API call, and for later turns it captures
+		// the response from the preceding tool/redirect call.
+		if response != nil && response.UsageMetadata != nil {
+			llmTurn.RecordTokens(
+				int64(response.UsageMetadata.PromptTokenCount),
+				int64(response.UsageMetadata.CandidatesTokenCount),
+			)
+		}
+
 		log.With("candidates_count", len(response.Candidates)).
 			Info("Received response from model")
 
 		if len(response.Candidates) == 0 {
+			llmTurn.End()
 			return resp, errors.New("no content generated - no candidates")
 		}
 
@@ -362,6 +378,7 @@ func (e *executor[Request, Response]) Execute(
 				return chat.SendMessage(ctx, retryMsg)
 			})
 			if err != nil {
+				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
 					return resp, requeueErr
 				}
@@ -377,14 +394,17 @@ func (e *executor[Request, Response]) Execute(
 
 			// Continue with the new response
 			response = retryResp
+			llmTurn.End()
 			continue
 		}
 
 		if candidate.Content == nil {
+			llmTurn.End()
 			return resp, errors.New("no content generated - candidate content is nil")
 		}
 
 		if len(candidate.Content.Parts) == 0 {
+			llmTurn.End()
 			return resp, errors.New("no content generated - no parts in candidate")
 		}
 
@@ -451,6 +471,7 @@ func (e *executor[Request, Response]) Execute(
 				if !reflect.ValueOf(finalResult).IsZero() {
 					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 					e.recordTurns(ctx, turn+1, false)
+					llmTurn.End()
 					return finalResult, nil
 				}
 
@@ -464,6 +485,7 @@ func (e *executor[Request, Response]) Execute(
 				return chat.Send(ctx, toolResponseParts...)
 			})
 			if err != nil {
+				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
 					return resp, requeueErr
 				}
@@ -475,6 +497,7 @@ func (e *executor[Request, Response]) Execute(
 				// Also record on trace span for easy viewing in Cloud Trace
 				trace.RecordTokenUsage(e.model, int64(response.UsageMetadata.PromptTokenCount), int64(response.UsageMetadata.CandidatesTokenCount))
 			}
+			llmTurn.End()
 			continue
 		}
 
@@ -491,6 +514,7 @@ func (e *executor[Request, Response]) Execute(
 				})
 			})
 			if err != nil {
+				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
 					return resp, requeueErr
 				}
@@ -503,6 +527,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			response = redirectResp
+			llmTurn.End()
 			continue
 		}
 
@@ -511,15 +536,18 @@ func (e *executor[Request, Response]) Execute(
 			extractedResponse, err := result.Extract[Response](responseText)
 			if err != nil {
 				log.With("response", responseText).With("error", err).Error("Failed to parse AI response")
+				llmTurn.End()
 				return resp, fmt.Errorf("failed to parse AI response: %w", err)
 			}
 			log.With("turns_completed", turn+1).Info("Successfully completed Google AI agent execution")
 			e.recordTurns(ctx, turn+1, false)
+			llmTurn.End()
 			return extractedResponse, nil
 		}
 
 		// Unexpected state
 		log.Error("Unexpected response format - no text and no tool calls")
+		llmTurn.End()
 		return resp, errors.New("unexpected response format from model")
 	}
 

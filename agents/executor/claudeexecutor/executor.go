@@ -320,6 +320,8 @@ func (e *executor[Request, Response]) Execute(
 
 	// Conversation loop with bounded turns to prevent runaway executions.
 	for turn := 0; turn < e.maxTurns; turn++ {
+		llmTurn := trace.BeginTurn(turn, e.modelName)
+
 		// Stream response with retry for transient errors
 		message, err := retry.RetryWithBackoff(ctx, e.retryConfig, "stream_message", isRetryableClaudeError, func() (anthropic.Message, error) {
 			stream := e.client.Messages.NewStreaming(ctx, params)
@@ -336,6 +338,7 @@ func (e *executor[Request, Response]) Execute(
 			return msg, nil
 		})
 		if err != nil {
+			llmTurn.End()
 			// If the error is a retryable Claude API error (429, 503, 504, 529) that
 			// exhausted inner retries, signal the workqueue to back off instead of
 			// immediately retrying — avoids contributing to API overload.
@@ -349,6 +352,7 @@ func (e *executor[Request, Response]) Execute(
 		if message.Usage.InputTokens > 0 || message.Usage.OutputTokens > 0 {
 			e.recordTokenMetrics(ctx, message.Usage.InputTokens, message.Usage.OutputTokens)
 			trace.RecordTokenUsage(e.modelName, message.Usage.InputTokens, message.Usage.OutputTokens)
+			llmTurn.RecordTokens(message.Usage.InputTokens, message.Usage.OutputTokens)
 		}
 
 		// Record prompt cache metrics. The API response includes two cache-specific
@@ -401,6 +405,7 @@ func (e *executor[Request, Response]) Execute(
 
 				result, err := executeToolCall(toolUse)
 				if err != nil {
+					llmTurn.End()
 					return response, err
 				}
 				toolResults = append(toolResults, result)
@@ -409,6 +414,7 @@ func (e *executor[Request, Response]) Execute(
 				if !reflect.ValueOf(finalResult).IsZero() {
 					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 					e.recordTurns(ctx, turn+1, false)
+					llmTurn.End()
 					return finalResult, nil
 				}
 			}
@@ -419,6 +425,7 @@ func (e *executor[Request, Response]) Execute(
 				Content: toolResults,
 			})
 
+			llmTurn.End()
 			continue
 		}
 
@@ -443,6 +450,7 @@ func (e *executor[Request, Response]) Execute(
 			})
 			// Force Claude to call the submit_result tool on the next turn.
 			params.ToolChoice = anthropic.ToolChoiceParamOfTool(submitToolName)
+			llmTurn.End()
 			continue
 		}
 
@@ -453,14 +461,17 @@ func (e *executor[Request, Response]) Execute(
 				log.With("response", textContent).
 					With("error", err).
 					Error("Failed to parse Claude response")
+				llmTurn.End()
 				return response, fmt.Errorf("failed to parse response: %w", err)
 			}
 
 			log.With("turns_completed", turn+1).Info("Successfully completed Claude agent execution")
 			e.recordTurns(ctx, turn+1, false)
+			llmTurn.End()
 			return resp, nil
 		}
 
+		llmTurn.End()
 		return response, errors.New("no content in Claude's response")
 	}
 

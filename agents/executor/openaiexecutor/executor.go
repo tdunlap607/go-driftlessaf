@@ -182,10 +182,13 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	for turn := range e.maxTurns {
+		llmTurn := trace.BeginTurn(turn, e.modelName)
+
 		completion, err := retry.RetryWithBackoff(ctx, e.retryConfig, "chat_completion", isRetryableOpenAIError, func() (*openai.ChatCompletion, error) {
 			return e.client.Chat.Completions.New(ctx, reqParams)
 		})
 		if err != nil {
+			llmTurn.End()
 			if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableOpenAIError, "OpenAI-compatible API"); requeueErr != nil {
 				return response, requeueErr
 			}
@@ -195,9 +198,11 @@ func (e *executor[Request, Response]) Execute(
 		if completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 {
 			e.recordTokenMetrics(ctx, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 			trace.RecordTokenUsage(e.modelName, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
+			llmTurn.RecordTokens(completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 		}
 
 		if len(completion.Choices) == 0 {
+			llmTurn.End()
 			return response, errors.New("no choices in completion response")
 		}
 
@@ -225,6 +230,7 @@ func (e *executor[Request, Response]) Execute(
 			for _, tc := range choice.Message.ToolCalls {
 				resJSON, err := executeToolCall(tc)
 				if err != nil {
+					llmTurn.End()
 					return response, err
 				}
 				reqParams.Messages = append(reqParams.Messages, openai.ToolMessage(resJSON, tc.ID))
@@ -234,8 +240,10 @@ func (e *executor[Request, Response]) Execute(
 			if !reflect.ValueOf(finalResult).IsZero() {
 				log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 				e.recordTurns(ctx, turn+1, false)
+				llmTurn.End()
 				return finalResult, nil
 			}
+			llmTurn.End()
 			continue
 		}
 
@@ -258,6 +266,7 @@ func (e *executor[Request, Response]) Execute(
 			// Note: we intentionally do not set tool_choice here — some models (e.g. reasoning
 			// models) do not support named tool_choice and return 400. The user message alone
 			// is sufficient to redirect the model to call the right tool.
+			llmTurn.End()
 			continue
 		}
 
@@ -266,13 +275,16 @@ func (e *executor[Request, Response]) Execute(
 			resp, err := result.Extract[Response](textContent)
 			if err != nil {
 				log.With("response", textContent).With("error", err).Error("Failed to parse response")
+				llmTurn.End()
 				return response, fmt.Errorf("failed to parse response: %w", err)
 			}
 			log.With("turns_completed", turn+1).Info("Successfully completed OpenAI-compatible agent execution")
 			e.recordTurns(ctx, turn+1, false)
+			llmTurn.End()
 			return resp, nil
 		}
 
+		llmTurn.End()
 		return response, errors.New("no content in completion response")
 	}
 

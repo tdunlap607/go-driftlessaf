@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -38,6 +39,14 @@ type ToolCall[T any] struct {
 	mu        sync.Mutex     // Protects mutable fields
 	ctx       context.Context
 	span      oteltrace.Span
+}
+
+// LLMTurn represents a single LLM call within a trace
+type LLMTurn[T any] struct {
+	span    oteltrace.Span
+	trace   *Trace[T]
+	prevCtx context.Context
+	once    sync.Once
 }
 
 // Trace represents a complete agent interaction from prompt to result
@@ -101,14 +110,92 @@ func newTrace[T any](ctx context.Context, prompt string) *Trace[T] {
 	}
 }
 
+// BeginTurn starts a new LLM turn span as a child of the trace span.
+// The trace context is updated so subsequent tool call spans are nested under
+// this turn span. Call End() on the returned LLMTurn when the turn completes.
+//
+// Callers MUST call End() on the current turn before calling BeginTurn again.
+// Overlapping turns corrupt the span hierarchy: the later End() restores a
+// stale context, causing subsequent spans to be parented incorrectly.
+func (t *Trace[T]) BeginTurn(turn int, modelName string) *LLMTurn[T] {
+	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
+		oteltrace.WithInstrumentationVersion("1.0.0"))
+
+	t.mu.Lock()
+	parentCtx := t.ctx
+	t.mu.Unlock()
+
+	newCtx, span := tr.Start(parentCtx, "chat "+modelName,
+		oteltrace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "chat"),
+			attribute.String("gen_ai.request.model", modelName),
+			attribute.Int("driftlessaf.turn.index", turn),
+		))
+
+	t.mu.Lock()
+	t.ctx = newCtx
+	t.mu.Unlock()
+
+	return &LLMTurn[T]{
+		span:    span,
+		trace:   t,
+		prevCtx: parentCtx,
+	}
+}
+
+// RecordTokens sets input/output token counts as span attributes on the turn span.
+func (lt *LLMTurn[T]) RecordTokens(inputTokens, outputTokens int64) {
+	if lt.span != nil {
+		lt.span.SetAttributes(
+			attribute.Int64("gen_ai.usage.input_tokens", inputTokens),
+			attribute.Int64("gen_ai.usage.output_tokens", outputTokens),
+		)
+	}
+}
+
+// End ends the turn span and restores the trace context to before the turn.
+// It is idempotent: subsequent calls are no-ops.
+func (lt *LLMTurn[T]) End() {
+	lt.once.Do(func() {
+		if lt.span != nil {
+			lt.span.End()
+		}
+		lt.trace.mu.Lock()
+		lt.trace.ctx = lt.prevCtx
+		lt.trace.mu.Unlock()
+	})
+}
+
 // StartToolCall starts a new tool call and returns it
 func (t *Trace[T]) StartToolCall(id, name string, params map[string]any) *ToolCall[T] {
 	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
 		oteltrace.WithInstrumentationVersion("1.0.0"))
-	ctx, span := tr.Start(t.ctx, "agent.tool_call", oteltrace.WithAttributes(
-		attribute.String("tool.name", name),
-		attribute.String("tool.id", id),
-	))
+
+	spanAttrs := []oteltrace.SpanStartOption{
+		oteltrace.WithAttributes(
+			attribute.String("gen_ai.operation.name", "execute_tool"),
+			attribute.String("tool.name", name),
+			attribute.String("tool.id", id),
+		),
+	}
+
+	if paramsJSON, err := json.Marshal(params); err == nil {
+		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(
+			attribute.String("gen_ai.input.messages", string(paramsJSON)),
+		))
+	}
+
+	if reasoning, ok := params["reasoning"].(string); ok && reasoning != "" {
+		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(
+			attribute.String("driftlessaf.tool.reasoning", reasoning),
+		))
+	}
+
+	t.mu.Lock()
+	parentCtx := t.ctx
+	t.mu.Unlock()
+
+	ctx, span := tr.Start(parentCtx, "execute_tool "+name, spanAttrs...)
 
 	return &ToolCall[T]{
 		ID:        id,
@@ -176,7 +263,12 @@ func (t *Trace[T]) RecordCacheTokenUsage(cacheReadTokens, cacheCreationTokens in
 func (t *Trace[T]) BadToolCall(id, name string, params map[string]any, err error) {
 	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
 		oteltrace.WithInstrumentationVersion("1.0.0"))
-	_, span := tr.Start(t.ctx, "agent.tool_call", oteltrace.WithAttributes(
+	t.mu.Lock()
+	parentCtx := t.ctx
+	t.mu.Unlock()
+
+	_, span := tr.Start(parentCtx, "execute_tool "+name, oteltrace.WithAttributes(
+		attribute.String("gen_ai.operation.name", "execute_tool"),
 		attribute.String("tool.name", name),
 		attribute.String("tool.id", id),
 		attribute.String("error", err.Error()),
@@ -214,6 +306,11 @@ func (tc *ToolCall[T]) Complete(result any, err error) {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())
 		} else {
+			if result != nil {
+				if resultJSON, marshalErr := json.Marshal(result); marshalErr == nil {
+					span.SetAttributes(attribute.String("gen_ai.output.messages", string(resultJSON)))
+				}
+			}
 			span.SetStatus(codes.Ok, "")
 		}
 		span.End()

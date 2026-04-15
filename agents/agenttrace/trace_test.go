@@ -13,6 +13,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // randomString generates a random string for testing
@@ -262,6 +267,136 @@ func TestBadToolCall(t *testing.T) {
 	if duration > time.Millisecond {
 		t.Errorf("bad tool call duration: got = %v, wanted = < 1ms", duration)
 	}
+}
+
+func TestLLMTurnBeginAndEnd(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	originalCtx := trace.ctx
+
+	// BeginTurn should replace trace.ctx with the turn's context.
+	turn := trace.BeginTurn(0, "test-model")
+	if turn == nil {
+		t.Fatal("BeginTurn: got = nil, wanted = non-nil LLMTurn")
+	}
+	if trace.ctx == originalCtx {
+		t.Error("BeginTurn: trace.ctx unchanged, wanted = new turn context")
+	}
+
+	// End should restore trace.ctx to the pre-turn context.
+	turn.End()
+	if trace.ctx != originalCtx {
+		t.Error("End: trace.ctx not restored, wanted = original context")
+	}
+}
+
+func TestLLMTurnEndIdempotent(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "test-model")
+	savedCtx := trace.ctx
+
+	// First End restores context.
+	turn.End()
+	if trace.ctx == savedCtx {
+		t.Error("End (first call): trace.ctx not restored to original")
+	}
+
+	// Begin a second turn to change ctx again, then call End twice on first turn.
+	turn2 := trace.BeginTurn(1, "test-model")
+	afterTurn2Ctx := trace.ctx
+
+	// Second call to the first turn's End must be a no-op — must not overwrite
+	// ctx that turn2 set.
+	turn.End()
+	if trace.ctx != afterTurn2Ctx {
+		t.Error("End (second call): overwrote ctx set by turn2, wanted = no-op")
+	}
+
+	turn2.End()
+}
+
+func TestLLMTurnRecordTokens(t *testing.T) {
+	// Use a real TracerProvider with a SpanRecorder so BeginTurn creates
+	// SDK spans whose attributes we can inspect after End().
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "test-model")
+	turn.RecordTokens(1000, 200)
+	turn.End()
+
+	spans := sr.Ended()
+	if len(spans) == 0 {
+		t.Fatal("no spans recorded")
+	}
+
+	// Find the "chat test-model" span (the turn span).
+	var chatAttrs []attribute.KeyValue
+	for _, s := range spans {
+		if s.Name() == "chat test-model" {
+			chatAttrs = s.Attributes()
+			break
+		}
+	}
+	if chatAttrs == nil {
+		t.Fatal("chat test-model span not found")
+	}
+
+	assertInt64Attr(t, chatAttrs, "gen_ai.usage.input_tokens", 1000)
+	assertInt64Attr(t, chatAttrs, "gen_ai.usage.output_tokens", 200)
+}
+
+func assertInt64Attr(t *testing.T, attrs []attribute.KeyValue, key string, want int64) {
+	t.Helper()
+	for _, a := range attrs {
+		if string(a.Key) == key {
+			if got := a.Value.AsInt64(); got != want {
+				t.Errorf("%s: got = %d, want = %d", key, got, want)
+			}
+			return
+		}
+	}
+	t.Errorf("%s: not found in span attributes", key)
+}
+
+// TestBeginTurnBeforeEnd documents that overlapping turns corrupt the span
+// hierarchy. If turn1.End() is called after BeginTurn(1), it restores a
+// stale context and subsequent tool calls are parented under the trace
+// span instead of turn2.
+func TestBeginTurnBeforeEnd(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn1 := trace.BeginTurn(0, "test-model")
+	afterTurn1Ctx := trace.ctx
+
+	// Begin turn2 without ending turn1 — violates the contract.
+	turn2 := trace.BeginTurn(1, "test-model")
+	afterTurn2Ctx := trace.ctx
+
+	// turn2 should be a child of the turn1 context (not the trace root),
+	// because turn1 was still active when turn2 started.
+	if afterTurn2Ctx == afterTurn1Ctx {
+		t.Error("BeginTurn(1): ctx unchanged from turn1, wanted = new context")
+	}
+
+	// Now ending turn1 restores its stale pre-turn context, clobbering
+	// turn2's context. This is the broken behavior the contract warns about.
+	turn1.End()
+	if trace.ctx == afterTurn2Ctx {
+		t.Error("turn1.End(): expected stale ctx restore to clobber turn2 context")
+	}
+
+	turn2.End()
 }
 
 func TestTraceStringEdgeCases(t *testing.T) {
