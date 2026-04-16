@@ -1,0 +1,48 @@
+[
+  {"name": "id", "type": "STRING", "mode": "REQUIRED"},
+  {"name": "otel_trace_id", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "input_prompt", "type": "STRING", "mode": "NULLABLE"},
+  {
+    "name": "exec_context",
+    "type": "RECORD",
+    "mode": "NULLABLE",
+    "fields": [
+      {"name": "reconciler_key", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "reconciler_type", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "commit_sha", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "turn_number", "type": "INTEGER", "mode": "NULLABLE"}
+    ]
+  },
+  {
+    "name": "tool_calls",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "fields": [
+      {"name": "id", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "name", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "params", "type": "JSON", "mode": "NULLABLE"},
+      {"name": "result", "type": "JSON", "mode": "NULLABLE"},
+      {"name": "error", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "start_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
+      {"name": "end_time", "type": "TIMESTAMP", "mode": "NULLABLE"}
+    ]
+  },
+  {
+    "name": "reasoning",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "fields": [
+      {"name": "thinking", "type": "STRING", "mode": "NULLABLE"}
+    ]
+  },
+  {"name": "result", "type": "JSON", "mode": "NULLABLE"},
+  {"name": "error", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "start_time", "type": "TIMESTAMP", "mode": "REQUIRED"},
+  {"name": "end_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
+  {"name": "metadata", "type": "JSON", "mode": "NULLABLE"},
+  {"name": "model", "type": "STRING", "mode": "NULLABLE"},
+  {"name": "input_tokens", "type": "INTEGER", "mode": "NULLABLE"},
+  {"name": "output_tokens", "type": "INTEGER", "mode": "NULLABLE"},
+  {"name": "cache_read_tokens", "type": "INTEGER", "mode": "NULLABLE"},
+  {"name": "cache_creation_tokens", "type": "INTEGER", "mode": "NULLABLE"}
+]
