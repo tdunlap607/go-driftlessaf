@@ -69,10 +69,7 @@ func toolParam(def toolcall.Definition) anthropic.ToolParam {
 	}
 
 	for _, p := range def.Parameters {
-		props[p.Name] = map[string]any{
-			"type":        p.Type,
-			"description": p.Description,
-		}
+		props[p.Name] = toolcall.ParameterToMap(p)
 		if p.Required {
 			required = append(required, p.Name)
 		}

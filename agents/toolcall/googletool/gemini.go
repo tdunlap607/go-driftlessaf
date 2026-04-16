@@ -99,10 +99,7 @@ func toolParam(def toolcall.Definition) *genai.FunctionDeclaration {
 	}
 
 	for _, p := range def.Parameters {
-		props[p.Name] = &genai.Schema{
-			Type:        genai.Type(p.Type),
-			Description: p.Description,
-		}
+		props[p.Name] = paramToGenAI(p)
 		if p.Required {
 			required = append(required, p.Name)
 		}
@@ -116,6 +113,65 @@ func toolParam(def toolcall.Definition) *genai.FunctionDeclaration {
 			Required:   required,
 		},
 	}
+}
+
+// paramToGenAI converts a Parameter to a *genai.Schema. Genai supports a
+// subset of JSON Schema, so fields without a genai equivalent are silently
+// dropped (e.g. OneOf, AllOf, pattern, numeric constraints).
+func paramToGenAI(p toolcall.Parameter) *genai.Schema {
+	s := &genai.Schema{
+		Type:        genai.Type(p.Type),
+		Description: p.Description,
+	}
+	if p.Items != nil {
+		s.Items = schemaToGenAI(p.Items)
+	}
+	if len(p.Properties) > 0 {
+		s.Properties = make(map[string]*genai.Schema, len(p.Properties))
+		for name, prop := range p.Properties {
+			s.Properties[name] = schemaToGenAI(prop)
+		}
+		s.Required = p.PropertyRequired
+	}
+	if len(p.Enum) > 0 {
+		s.Enum = make([]string, 0, len(p.Enum))
+		for _, v := range p.Enum {
+			if str, ok := v.(string); ok {
+				s.Enum = append(s.Enum, str)
+			}
+		}
+	}
+	return s
+}
+
+// schemaToGenAI recursively converts a *toolcall.Schema to *genai.Schema.
+func schemaToGenAI(ts *toolcall.Schema) *genai.Schema {
+	if ts == nil || ts.False {
+		return nil
+	}
+	s := &genai.Schema{
+		Type:        genai.Type(ts.Type),
+		Description: ts.Description,
+	}
+	if ts.Items != nil {
+		s.Items = schemaToGenAI(ts.Items)
+	}
+	if len(ts.Properties) > 0 {
+		s.Properties = make(map[string]*genai.Schema, len(ts.Properties))
+		for name, prop := range ts.Properties {
+			s.Properties[name] = schemaToGenAI(prop)
+		}
+		s.Required = ts.Required
+	}
+	if len(ts.Enum) > 0 {
+		s.Enum = make([]string, 0, len(ts.Enum))
+		for _, v := range ts.Enum {
+			if str, ok := v.(string); ok {
+				s.Enum = append(s.Enum, str)
+			}
+		}
+	}
+	return s
 }
 
 func handler[Resp any](t toolcall.Tool[Resp]) func(context.Context, *genai.FunctionCall, *agenttrace.Trace[Resp], *Resp) *genai.FunctionResponse {
