@@ -318,9 +318,9 @@ func (e *executor[Request, Response]) Execute(
 		})
 	}
 
-	// Conversation loop with bounded turns to prevent runaway executions.
-	for turn := 0; turn < e.maxTurns; turn++ {
+	executeTurn := func(turn int) (Response, bool, error) {
 		llmTurn := trace.BeginTurn(turn, e.modelName)
+		defer llmTurn.End()
 
 		// Stream response with retry for transient errors
 		message, err := retry.RetryWithBackoff(ctx, e.retryConfig, "stream_message", isRetryableClaudeError, func() (anthropic.Message, error) {
@@ -338,14 +338,13 @@ func (e *executor[Request, Response]) Execute(
 			return msg, nil
 		})
 		if err != nil {
-			llmTurn.End()
 			// If the error is a retryable Claude API error (429, 503, 504, 529) that
 			// exhausted inner retries, signal the workqueue to back off instead of
 			// immediately retrying — avoids contributing to API overload.
 			if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableClaudeError, "Claude API"); requeueErr != nil {
-				return response, requeueErr
+				return response, true, requeueErr
 			}
-			return response, fmt.Errorf("failed to stream Claude response: %w", err)
+			return response, true, fmt.Errorf("failed to stream Claude response: %w", err)
 		}
 
 		// Record token usage in metrics and trace span
@@ -405,8 +404,7 @@ func (e *executor[Request, Response]) Execute(
 
 				result, err := executeToolCall(toolUse)
 				if err != nil {
-					llmTurn.End()
-					return response, err
+					return response, true, err
 				}
 				toolResults = append(toolResults, result)
 
@@ -414,8 +412,7 @@ func (e *executor[Request, Response]) Execute(
 				if !reflect.ValueOf(finalResult).IsZero() {
 					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 					e.recordTurns(ctx, turn+1, false)
-					llmTurn.End()
-					return finalResult, nil
+					return finalResult, true, nil
 				}
 			}
 
@@ -425,8 +422,7 @@ func (e *executor[Request, Response]) Execute(
 				Content: toolResults,
 			})
 
-			llmTurn.End()
-			continue
+			return response, false, nil
 		}
 
 		// When submit_result is configured, it is the only valid exit path.
@@ -450,8 +446,7 @@ func (e *executor[Request, Response]) Execute(
 			})
 			// Force Claude to call the submit_result tool on the next turn.
 			params.ToolChoice = anthropic.ToolChoiceParamOfTool(submitToolName)
-			llmTurn.End()
-			continue
+			return response, false, nil
 		}
 
 		// Fallback: parse text response as JSON when submit_result is not configured
@@ -461,18 +456,25 @@ func (e *executor[Request, Response]) Execute(
 				log.With("response", textContent).
 					With("error", err).
 					Error("Failed to parse Claude response")
-				llmTurn.End()
-				return response, fmt.Errorf("failed to parse response: %w", err)
+				return response, true, fmt.Errorf("failed to parse response: %w", err)
 			}
 
 			log.With("turns_completed", turn+1).Info("Successfully completed Claude agent execution")
 			e.recordTurns(ctx, turn+1, false)
-			llmTurn.End()
-			return resp, nil
+			return resp, true, nil
 		}
 
-		llmTurn.End()
-		return response, errors.New("no content in Claude's response")
+		return response, true, errors.New("no content in Claude's response")
+	}
+
+	// Conversation loop with bounded turns to prevent runaway executions.
+	for turn := range e.maxTurns {
+		resp, done, err := executeTurn(turn)
+		// done=true on all terminal paths (including errors); || err != nil is a
+		// safety net in case a future path sets err without setting done.
+		if done || err != nil {
+			return resp, err
+		}
 	}
 
 	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")

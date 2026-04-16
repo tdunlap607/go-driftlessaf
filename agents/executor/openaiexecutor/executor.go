@@ -181,18 +181,18 @@ func (e *executor[Request, Response]) Execute(
 		return string(resBytes), nil
 	}
 
-	for turn := range e.maxTurns {
+	executeTurn := func(turn int) (Response, bool, error) {
 		llmTurn := trace.BeginTurn(turn, e.modelName)
+		defer llmTurn.End()
 
 		completion, err := retry.RetryWithBackoff(ctx, e.retryConfig, "chat_completion", isRetryableOpenAIError, func() (*openai.ChatCompletion, error) {
 			return e.client.Chat.Completions.New(ctx, reqParams)
 		})
 		if err != nil {
-			llmTurn.End()
 			if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableOpenAIError, "OpenAI-compatible API"); requeueErr != nil {
-				return response, requeueErr
+				return response, true, requeueErr
 			}
-			return response, fmt.Errorf("failed to get completion (turn %d): %w", turn, err)
+			return response, true, fmt.Errorf("failed to get completion (turn %d): %w", turn, err)
 		}
 
 		if completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 {
@@ -202,8 +202,7 @@ func (e *executor[Request, Response]) Execute(
 		}
 
 		if len(completion.Choices) == 0 {
-			llmTurn.End()
-			return response, errors.New("no choices in completion response")
+			return response, true, errors.New("no choices in completion response")
 		}
 
 		choice := completion.Choices[0]
@@ -230,8 +229,7 @@ func (e *executor[Request, Response]) Execute(
 			for _, tc := range choice.Message.ToolCalls {
 				resJSON, err := executeToolCall(tc)
 				if err != nil {
-					llmTurn.End()
-					return response, err
+					return response, true, err
 				}
 				reqParams.Messages = append(reqParams.Messages, openai.ToolMessage(resJSON, tc.ID))
 			}
@@ -240,11 +238,9 @@ func (e *executor[Request, Response]) Execute(
 			if !reflect.ValueOf(finalResult).IsZero() {
 				log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 				e.recordTurns(ctx, turn+1, false)
-				llmTurn.End()
-				return finalResult, nil
+				return finalResult, true, nil
 			}
-			llmTurn.End()
-			continue
+			return response, false, nil
 		}
 
 		textContent := choice.Message.Content
@@ -266,8 +262,7 @@ func (e *executor[Request, Response]) Execute(
 			// Note: we intentionally do not set tool_choice here — some models (e.g. reasoning
 			// models) do not support named tool_choice and return 400. The user message alone
 			// is sufficient to redirect the model to call the right tool.
-			llmTurn.End()
-			continue
+			return response, false, nil
 		}
 
 		// Fallback: parse text response as JSON.
@@ -275,17 +270,23 @@ func (e *executor[Request, Response]) Execute(
 			resp, err := result.Extract[Response](textContent)
 			if err != nil {
 				log.With("response", textContent).With("error", err).Error("Failed to parse response")
-				llmTurn.End()
-				return response, fmt.Errorf("failed to parse response: %w", err)
+				return response, true, fmt.Errorf("failed to parse response: %w", err)
 			}
 			log.With("turns_completed", turn+1).Info("Successfully completed OpenAI-compatible agent execution")
 			e.recordTurns(ctx, turn+1, false)
-			llmTurn.End()
-			return resp, nil
+			return resp, true, nil
 		}
 
-		llmTurn.End()
-		return response, errors.New("no content in completion response")
+		return response, true, errors.New("no content in completion response")
+	}
+
+	for turn := range e.maxTurns {
+		resp, done, err := executeTurn(turn)
+		// done=true on all terminal paths (including errors); || err != nil is a
+		// safety net in case a future path sets err without setting done.
+		if done || err != nil {
+			return resp, err
+		}
 	}
 
 	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")

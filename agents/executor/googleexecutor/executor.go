@@ -335,8 +335,10 @@ func (e *executor[Request, Response]) Execute(
 
 	// Handle the conversation loop with bounded turns to prevent runaway executions.
 	var responseText string
-	for turn := 0; turn < e.maxTurns; turn++ {
+	executeTurn := func(turn int, response *genai.GenerateContentResponse) (Response, *genai.GenerateContentResponse, bool, error) {
+		var zero Response
 		llmTurn := trace.BeginTurn(turn, e.model)
+		defer llmTurn.End()
 
 		// Record tokens for the response being processed in this turn.
 		// Unlike claude/openai executors (which record tokens right after
@@ -355,8 +357,7 @@ func (e *executor[Request, Response]) Execute(
 			Info("Received response from model")
 
 		if len(response.Candidates) == 0 {
-			llmTurn.End()
-			return resp, errors.New("no content generated - no candidates")
+			return zero, nil, true, errors.New("no content generated - no candidates")
 		}
 
 		candidate := response.Candidates[0]
@@ -378,11 +379,10 @@ func (e *executor[Request, Response]) Execute(
 				return chat.SendMessage(ctx, retryMsg)
 			})
 			if err != nil {
-				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
-					return resp, requeueErr
+					return zero, nil, true, requeueErr
 				}
-				return resp, fmt.Errorf("failed to send retry message after malformed function call: %w", err)
+				return zero, nil, true, fmt.Errorf("failed to send retry message after malformed function call: %w", err)
 			}
 
 			// Record metrics for retry call
@@ -393,19 +393,15 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			// Continue with the new response
-			response = retryResp
-			llmTurn.End()
-			continue
+			return zero, retryResp, false, nil
 		}
 
 		if candidate.Content == nil {
-			llmTurn.End()
-			return resp, errors.New("no content generated - candidate content is nil")
+			return zero, nil, true, errors.New("no content generated - candidate content is nil")
 		}
 
 		if len(candidate.Content.Parts) == 0 {
-			llmTurn.End()
-			return resp, errors.New("no content generated - no parts in candidate")
+			return zero, nil, true, errors.New("no content generated - no parts in candidate")
 		}
 
 		// Check for function calls or text
@@ -471,8 +467,7 @@ func (e *executor[Request, Response]) Execute(
 				if !reflect.ValueOf(finalResult).IsZero() {
 					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
 					e.recordTurns(ctx, turn+1, false)
-					llmTurn.End()
-					return finalResult, nil
+					return finalResult, nil, true, nil
 				}
 
 				toolResponseParts = append(toolResponseParts, &genai.Part{
@@ -481,24 +476,22 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			// Send tool responses back to the chat with retry for transient errors
-			response, err = retry.RetryWithBackoff(ctx, e.retryConfig, "send_tool_responses", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
+			nextResponse, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_tool_responses", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
 				return chat.Send(ctx, toolResponseParts...)
 			})
 			if err != nil {
-				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
-					return resp, requeueErr
+					return zero, nil, true, requeueErr
 				}
-				return resp, fmt.Errorf("failed to send tool responses: %w", err)
+				return zero, nil, true, fmt.Errorf("failed to send tool responses: %w", err)
 			}
 
-			if response != nil && response.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, trace, response.UsageMetadata)
+			if nextResponse != nil && nextResponse.UsageMetadata != nil {
+				e.recordTokenMetrics(ctx, trace, nextResponse.UsageMetadata)
 				// Also record on trace span for easy viewing in Cloud Trace
-				trace.RecordTokenUsage(e.model, int64(response.UsageMetadata.PromptTokenCount), int64(response.UsageMetadata.CandidatesTokenCount))
+				trace.RecordTokenUsage(e.model, int64(nextResponse.UsageMetadata.PromptTokenCount), int64(nextResponse.UsageMetadata.CandidatesTokenCount))
 			}
-			llmTurn.End()
-			continue
+			return zero, nextResponse, false, nil
 		}
 
 		// When submit_result is configured, it is the only valid exit path.
@@ -514,11 +507,10 @@ func (e *executor[Request, Response]) Execute(
 				})
 			})
 			if err != nil {
-				llmTurn.End()
 				if requeueErr := retry.RequeueIfRetryable(ctx, err, isRetryableVertexError, "Vertex AI"); requeueErr != nil {
-					return resp, requeueErr
+					return zero, nil, true, requeueErr
 				}
-				return resp, fmt.Errorf("failed to send submit_result redirect: %w", err)
+				return zero, nil, true, fmt.Errorf("failed to send submit_result redirect: %w", err)
 			}
 
 			if redirectResp != nil && redirectResp.UsageMetadata != nil {
@@ -526,9 +518,7 @@ func (e *executor[Request, Response]) Execute(
 				trace.RecordTokenUsage(e.model, int64(redirectResp.UsageMetadata.PromptTokenCount), int64(redirectResp.UsageMetadata.CandidatesTokenCount))
 			}
 
-			response = redirectResp
-			llmTurn.End()
-			continue
+			return zero, redirectResp, false, nil
 		}
 
 		// Fallback: parse text response as JSON when submit_result is not configured
@@ -536,19 +526,29 @@ func (e *executor[Request, Response]) Execute(
 			extractedResponse, err := result.Extract[Response](responseText)
 			if err != nil {
 				log.With("response", responseText).With("error", err).Error("Failed to parse AI response")
-				llmTurn.End()
-				return resp, fmt.Errorf("failed to parse AI response: %w", err)
+				return zero, nil, true, fmt.Errorf("failed to parse AI response: %w", err)
 			}
 			log.With("turns_completed", turn+1).Info("Successfully completed Google AI agent execution")
 			e.recordTurns(ctx, turn+1, false)
-			llmTurn.End()
-			return extractedResponse, nil
+			return extractedResponse, nil, true, nil
 		}
 
 		// Unexpected state
 		log.Error("Unexpected response format - no text and no tool calls")
-		llmTurn.End()
-		return resp, errors.New("unexpected response format from model")
+		return zero, nil, true, errors.New("unexpected response format from model")
+	}
+
+	for turn := range e.maxTurns {
+		result, nextResp, done, err := executeTurn(turn, response)
+		// done=true on all terminal paths (including errors); || err != nil is a
+		// safety net in case a future path sets err without setting done.
+		if done || err != nil {
+			return result, err
+		}
+		if nextResp == nil {
+			return resp, errors.New("retry returned nil response")
+		}
+		response = nextResp
 	}
 
 	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")
