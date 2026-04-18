@@ -44,6 +44,7 @@ func WithTemperature[Request promptbuilder.Bindable, Response any](temp float64)
 			return fmt.Errorf("temperature must be between 0.0 and 1.0, got %f", temp)
 		}
 		e.temperature = temp
+		e.temperatureSet = true
 		return nil
 	}
 }

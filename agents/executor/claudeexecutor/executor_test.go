@@ -201,6 +201,54 @@ Please solve this problem and provide your answer in JSON format:
 	}
 }
 
+// TestOpus47WithSamplingParamsAndThinking verifies the claudeexecutor is
+// compatible with Claude Opus 4.7, which (a) rejects the sampling-param fields
+// (temperature, top_p, top_k) with a 400, and (b) replaced extended-thinking
+// budgets with adaptive thinking. The executor must drop temperature and map
+// WithThinking to adaptive mode. A single Execute hitting the live API proves
+// the request is accepted end-to-end.
+func TestOpus47WithSamplingParamsAndThinking(t *testing.T) {
+	ctx := context.Background()
+	projectID := detectProjectID(ctx, t)
+
+	// Opus 4.7 is served via the global Vertex endpoint.
+	const model = "claude-opus-4-7@default"
+	const region = "global"
+
+	client := anthropic.NewClient(
+		vertex.WithGoogleAuth(ctx, region, projectID, "https://www.googleapis.com/auth/cloud-platform"),
+	)
+
+	prompt, err := promptbuilder.NewPrompt(`Reply in JSON: {"answer":"<short>","reasoning":"<one sentence>"}.
+Question: {{question}}`)
+	if err != nil {
+		t.Fatalf("Failed to create prompt: %v", err)
+	}
+
+	exec, err := claudeexecutor.New[*simpleRequest, *simpleResponse](
+		client,
+		prompt,
+		claudeexecutor.WithModel[*simpleRequest, *simpleResponse](model),
+		claudeexecutor.WithMaxTokens[*simpleRequest, *simpleResponse](4096),
+		// Both must be tolerated on 4.7: temperature is silently dropped, and
+		// WithThinking is mapped to adaptive thinking.
+		claudeexecutor.WithTemperature[*simpleRequest, *simpleResponse](0.2),
+		claudeexecutor.WithThinking[*simpleRequest, *simpleResponse](2048),
+	)
+	if err != nil {
+		t.Fatalf("Failed to create executor: %v", err)
+	}
+
+	resp, err := exec.Execute(ctx, &simpleRequest{Question: "What is 2 + 2?"}, nil)
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if resp == nil || resp.Answer == "" {
+		t.Fatalf("Expected non-empty answer, got %+v", resp)
+	}
+	t.Logf("Opus 4.7 answered: %q", resp.Answer)
+}
+
 // mockObserver implements evals.Observer for testing
 type mockObserver struct {
 	failures []string

@@ -14,6 +14,7 @@ import (
 	"maps"
 	"reflect"
 	"slices"
+	"strings"
 
 	"chainguard.dev/driftlessaf/agents/agenttrace"
 	"chainguard.dev/driftlessaf/agents/executor/retry"
@@ -48,6 +49,7 @@ type executor[Request promptbuilder.Bindable, Response any] struct {
 	maxTokens            int64
 	maxTurns             int // maximum conversation turns before aborting
 	temperature          float64
+	temperatureSet       bool                          // true when WithTemperature was applied; lets us warn if it gets dropped for a model that doesn't accept sampling params
 	thinkingBudgetTokens *int64                        // nil = disabled, non-nil = enabled with budget
 	submitTool           claudetool.Metadata[Response] // opt-in: set via WithSubmitResultProvider
 	genaiMetrics         *metrics.GenAI                // OpenTelemetry metrics for token usage and tool calls
@@ -200,11 +202,20 @@ func (e *executor[Request, Response]) Execute(
 		Tools:     toolDefs,
 	}
 
-	params.Temperature = anthropic.Float(e.temperature)
-	// Set temperature - must be 1.0 when thinking is enabled
-	// See: https://docs.claude.com/en/docs/build-with-claude/extended-thinking#important-considerations-when-using-extended-thinking
-	if e.thinkingBudgetTokens != nil {
-		params.Temperature = anthropic.Float(1.0)
+	// Opus 4.7 removed the sampling-param fields (temperature, top_p, top_k);
+	// the API returns a 400 when any are set to a non-default value. Gate here
+	// so callers don't need model-aware logic.
+	// See: https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#sampling-parameters-removed
+	if supportsSamplingParams(e.modelName) {
+		params.Temperature = anthropic.Float(e.temperature)
+		// Extended thinking requires temperature=1.0.
+		// See: https://docs.claude.com/en/docs/build-with-claude/extended-thinking#important-considerations-when-using-extended-thinking
+		if e.thinkingBudgetTokens != nil {
+			params.Temperature = anthropic.Float(1.0)
+		}
+	} else if e.temperatureSet {
+		clog.WarnContext(ctx, "dropping temperature: not supported by this model",
+			"model", e.modelName, "temperature", e.temperature)
 	}
 
 	// Add system instructions if provided
@@ -224,12 +235,27 @@ func (e *executor[Request, Response]) Execute(
 		params.System = []anthropic.TextBlockParam{systemBlock}
 	}
 
-	// Add thinking configuration if enabled
+	// Add thinking configuration if enabled. Opus 4.7 removed extended-thinking
+	// budgets; adaptive is the only thinking-on mode. Map WithThinking to adaptive
+	// for those models and warn that the requested budget was ignored. Display is
+	// set to summarized so trace.Reasoning stays populated (Opus 4.7 omits thinking
+	// content by default).
+	// See: https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#extended-thinking-budgets-removed
 	if e.thinkingBudgetTokens != nil {
-		params.Thinking = anthropic.ThinkingConfigParamUnion{
-			OfEnabled: &anthropic.ThinkingConfigEnabledParam{
-				BudgetTokens: *e.thinkingBudgetTokens,
-			},
+		if supportsExtendedThinkingBudget(e.modelName) {
+			params.Thinking = anthropic.ThinkingConfigParamUnion{
+				OfEnabled: &anthropic.ThinkingConfigEnabledParam{
+					BudgetTokens: *e.thinkingBudgetTokens,
+				},
+			}
+		} else {
+			params.Thinking = anthropic.ThinkingConfigParamUnion{
+				OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{
+					Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized,
+				},
+			}
+			clog.WarnContext(ctx, "mapping WithThinking to adaptive thinking: extended-thinking budgets not supported by this model",
+				"model", e.modelName, "budget_tokens", *e.thinkingBudgetTokens)
 		}
 	}
 
@@ -521,4 +547,21 @@ func (e *executor[Request, Response]) recordTurns(ctx context.Context, turns int
 	attrs := e.resourceLabelsToAttributes()
 	attrs = append(attrs, attribute.String("gen_ai.provider.name", "anthropic"))
 	e.genaiMetrics.RecordTurns(ctx, e.modelName, turns, limitExceeded, attrs...)
+}
+
+// supportsSamplingParams reports whether the Anthropic API accepts the
+// temperature, top_p, and top_k parameters for the given model. Opus 4.7
+// returns a 400 ("`temperature` is deprecated for this model.") when any of
+// these is set to a non-default value.
+// See: https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#sampling-parameters-removed
+func supportsSamplingParams(modelName string) bool {
+	return !strings.HasPrefix(modelName, "claude-opus-4-7")
+}
+
+// supportsExtendedThinkingBudget reports whether the Anthropic API accepts the
+// extended-thinking budget parameter (thinking.type="enabled", budget_tokens=N)
+// for the given model. Opus 4.7 removed this in favor of adaptive thinking.
+// See: https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7#extended-thinking-budgets-removed
+func supportsExtendedThinkingBudget(modelName string) bool {
+	return !strings.HasPrefix(modelName, "claude-opus-4-7")
 }

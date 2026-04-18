@@ -86,6 +86,21 @@ SPDX-License-Identifier: Apache-2.0
 // Note: When thinking is enabled, temperature is automatically set to 1.0 as required
 // by the Claude API. See: https://docs.claude.com/en/docs/build-with-claude/extended-thinking
 //
+// # Claude Opus 4.7 Compatibility
+//
+// Opus 4.7 introduced two breaking changes that the executor handles transparently
+// so callers don't need model-aware logic:
+//
+//   - Sampling parameters (temperature, top_p, top_k) are rejected with a 400.
+//     WithTemperature is silently dropped for Opus 4.7 models; a warning is logged
+//     once per Execute if the caller explicitly set it.
+//   - Extended-thinking budgets are replaced by adaptive thinking. WithThinking(N)
+//     is mapped to adaptive thinking for Opus 4.7 (the budget is advisory to the
+//     model via adaptive mode). A warning is logged once per Execute noting the
+//     mapping. Display is set to "summarized" so reasoning traces remain populated.
+//
+// See: https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7
+//
 // # Type Safety
 //
 // The executor is generic over Request and Response types, ensuring type safety
