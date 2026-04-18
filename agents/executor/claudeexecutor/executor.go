@@ -194,7 +194,7 @@ func (e *executor[Request, Response]) Execute(
 
 	// Create request parameters
 	params := anthropic.MessageNewParams{
-		Model:     anthropic.Model(e.modelName),
+		Model:     e.modelName,
 		MaxTokens: e.maxTokens,
 		Messages:  messages,
 		Tools:     toolDefs,
