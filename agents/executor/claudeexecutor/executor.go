@@ -419,6 +419,9 @@ func (e *executor[Request, Response]) Execute(
 
 		// Handle tool calls
 		if len(toolUseBlocks) > 0 {
+			// Clear any forced ToolChoice from a prior text-fallback redirect; otherwise a failing forced call would lock every subsequent turn into the same tool.
+			params.ToolChoice = anthropic.ToolChoiceUnionParam{}
+
 			// Add Claude's response to conversation
 			params.Messages = append(params.Messages, message.ToParam())
 
