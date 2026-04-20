@@ -290,14 +290,23 @@ func (m *Manager) prepareClone(ctx context.Context, cl *clone, ref string, res *
 		return "", false, fmt.Errorf("getting remote ref %s: %w", ref, err)
 	}
 
+	headRef, err := repo.Head()
+	if err != nil {
+		return "", false, fmt.Errorf("getting HEAD ref: %w", err)
+	}
+
 	worktree, err := repo.Worktree()
 	if err != nil {
 		return "", false, fmt.Errorf("getting worktree: %w", err)
 	}
 
-	worktreeCheckout := &git.CheckoutOptions{Hash: remoteRef.Hash(), Force: true}
-	if err := worktree.Checkout(worktreeCheckout); err != nil {
-		return remoteRef.Hash().String(), false, fmt.Errorf("checking out ref %s: %w", ref, err)
+	// Skip checkout when HEAD already matches the remote ref: the worktree
+	// already contains the correct content.
+	if headRef.Hash() != remoteRef.Hash() {
+		worktreeCheckout := &git.CheckoutOptions{Hash: remoteRef.Hash(), Force: true}
+		if err := worktree.Checkout(worktreeCheckout); err != nil {
+			return remoteRef.Hash().String(), false, fmt.Errorf("checking out ref %s: %w", ref, err)
+		}
 	}
 
 	commit, err := repo.CommitObject(remoteRef.Hash())
