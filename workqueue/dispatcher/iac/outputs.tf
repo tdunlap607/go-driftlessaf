@@ -21,7 +21,8 @@ SPDX-License-Identifier: Apache-2.0
 output "recorder-schemas" {
   value = {
     "dev.chainguard.workqueue.error.v1" = {
-      schema = file("${path.module}/schemas/workqueue_error.schema.json")
+      schema          = file("${path.module}/schemas/workqueue_error.schema.json")
+      partition_field = "occurAt"
       // Table is still under active development; disable delete protection so
       // the schema can be iterated on without the schema-deletion playbook.
       deletion_protection = false

@@ -107,6 +107,12 @@ func TestCloudEventErrorEmitter_EmitsEvent(t *testing.T) {
 	if payload.Action != "dead-lettered" {
 		t.Errorf("payload.Action: got = %q, wanted = %q", payload.Action, "dead-lettered")
 	}
+	if payload.OccurAt.IsZero() {
+		t.Error("payload.OccurAt: expected non-zero timestamp")
+	}
+	if !payload.OccurAt.Equal(received.Time()) {
+		t.Errorf("payload.OccurAt %v != CE envelope time %v", payload.OccurAt, received.Time())
+	}
 }
 
 func TestCloudEventErrorEmitter_IntegrationWithDispatcher(t *testing.T) {
@@ -169,5 +175,11 @@ func TestCloudEventErrorEmitter_IntegrationWithDispatcher(t *testing.T) {
 	}
 	if payload.Action != "dead-lettered" {
 		t.Errorf("payload.Action: got = %q, wanted = %q", payload.Action, "dead-lettered")
+	}
+	if payload.OccurAt.IsZero() {
+		t.Error("payload.OccurAt: expected non-zero timestamp")
+	}
+	if !payload.OccurAt.Equal(received.Time()) {
+		t.Errorf("payload.OccurAt %v != CE envelope time %v", payload.OccurAt, received.Time())
 	}
 }

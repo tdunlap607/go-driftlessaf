@@ -47,6 +47,10 @@ type DispatcherErrorEvent struct {
 	// NonRetriableReason is set when Action is "dropped", providing the
 	// reason the error was marked non-retriable.
 	NonRetriableReason string `json:"nonRetriableReason,omitempty"`
+
+	// OccurAt is the time the error occurred. This field is used as the
+	// BigQuery partition field.
+	OccurAt time.Time `json:"occurAt"`
 }
 
 // cloudEventErrorEmitter publishes dispatch errors as CloudEvents.
@@ -64,7 +68,8 @@ func (e *cloudEventErrorEmitter) emit(ctx context.Context, ec ErrorContext) {
 	ce.SetType(ErrorEventType)
 	ce.SetSource(e.workqueueName)
 	ce.SetSubject(ec.Key)
-	ce.SetTime(time.Now())
+	occurAt := time.Now()
+	ce.SetTime(occurAt)
 	ce.SetExtension("action", ec.Action.String())
 
 	if err := ce.SetData(cloudevents.ApplicationJSON, &DispatcherErrorEvent{
@@ -73,6 +78,7 @@ func (e *cloudEventErrorEmitter) emit(ctx context.Context, ec ErrorContext) {
 		Attempts:           ec.Attempts,
 		Action:             ec.Action.String(),
 		NonRetriableReason: ec.NonRetriableReason,
+		OccurAt:            occurAt,
 	}); err != nil {
 		clog.ErrorContext(ctx, "failed to set dispatcher error event data",
 			"key", ec.Key, "error", err)
