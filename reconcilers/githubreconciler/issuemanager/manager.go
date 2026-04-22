@@ -197,8 +197,6 @@ func (im *IM[T]) NewSession(
 		opts.ListOptions.Page = resp.NextPage
 	}
 
-	log := clog.FromContext(ctx)
-
 	// Filter out pull requests and extract data upfront (GitHub's API returns both)
 	var existingIssues []existingIssue[T]
 	for _, issue := range allIssues {
@@ -207,7 +205,7 @@ func (im *IM[T]) NewSession(
 			data, err := im.templateExecutor.Extract(issue.GetBody())
 			if err != nil {
 				// Skip issues with malformed data - they won't be matched anyway
-				log.Warnf("Skipping issue #%d: failed to extract embedded data: %v", issue.GetNumber(), err)
+				clog.FromContext(ctx).Warnf("Skipping issue #%d: failed to extract embedded data: %v", issue.GetNumber(), err)
 				continue
 			}
 			existingIssues = append(existingIssues, existingIssue[T]{
