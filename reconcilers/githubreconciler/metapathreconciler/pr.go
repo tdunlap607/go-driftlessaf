@@ -32,7 +32,7 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePullRequest(ctx context.Context, re
 
 	// Only process open PRs.
 	if pr.GetState() != "open" {
-		log.With("state", pr.GetState()).Debug("PR is not open, skipping")
+		clog.DebugContext(ctx, "PR is not open, skipping", "state", pr.GetState())
 		return nil
 	}
 

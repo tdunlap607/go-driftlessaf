@@ -18,14 +18,15 @@ import (
 // dynamicTraceKeys are JSON keys whose values are non-deterministic
 // (generated IDs, wall-clock timestamps) and must be excluded from
 // whole-value comparisons.
-var dynamicTraceKeys = map[string]bool{
-	"id": true, "start_time": true, "end_time": true,
+var dynamicTraceKeys = map[string]struct{}{
+	"id": {}, "start_time": {}, "end_time": {},
 }
 
 // ignoreDynamic is a cmp option that drops dynamic keys from map comparisons
 // so that test expectations only contain deterministic fields.
 var ignoreDynamic = cmpopts.IgnoreMapEntries(func(k string, _ any) bool {
-	return dynamicTraceKeys[k]
+	_, ok := dynamicTraceKeys[k]
+	return ok
 })
 
 // marshalRoundTrip marshals a trace and unmarshals it into a map, stripping

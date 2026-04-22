@@ -76,15 +76,13 @@ func New[Req promptbuilder.Bindable, Resp Result, CB any](
 // For issues: runs the agent to create/update a PR.
 // For PRs: finds linked issues with the required label and queues them for processing.
 func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, res *githubreconciler.Resource, gh *github.Client) error {
-	log := clog.FromContext(ctx)
-
 	switch res.Type {
 	case githubreconciler.ResourceTypeIssue:
 		return r.reconcileIssue(ctx, res, gh)
 	case githubreconciler.ResourceTypePullRequest:
 		return r.reconcilePullRequest(ctx, res, gh)
 	default:
-		log.With("type", res.Type).Warn("Unexpected resource type")
+		clog.WarnContext(ctx, "Unexpected resource type", "type", res.Type)
 		return nil
 	}
 }

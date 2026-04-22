@@ -84,8 +84,6 @@ func (e *executor[Request, Response]) Execute(
 	request Request,
 	tools map[string]openaistool.Metadata[Response],
 ) (response Response, err error) {
-	log := clog.FromContext(ctx)
-
 	boundPrompt, err := request.Bind(e.prompt)
 	if err != nil {
 		return response, fmt.Errorf("failed to bind request to prompt: %w", err)
@@ -153,21 +151,21 @@ func (e *executor[Request, Response]) Execute(
 	finalResultPtr := &finalResult
 
 	executeToolCall := func(tc openai.ChatCompletionMessageToolCall) (string, error) {
-		l := log.With("tool", tc.Function.Name).With("id", tc.ID)
+		kvs := []any{"tool", tc.Function.Name, "id", tc.ID}
 		var args map[string]any
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err == nil {
 			for k, v := range args {
-				l = l.With("args."+k, v)
+				kvs = append(kvs, "args."+k, v)
 			}
 		}
-		l.Info("Executing tool call")
+		clog.InfoContext(ctx, "Executing tool call", kvs...)
 
 		var res map[string]any
 		if meta, ok := tools[tc.Function.Name]; ok {
 			e.recordToolCall(ctx, tc.Function.Name)
 			res = meta.Handler(ctx, tc, trace, finalResultPtr)
 		} else {
-			log.With("tool", tc.Function.Name).Error("Unknown tool requested")
+			clog.ErrorContext(ctx, "Unknown tool requested", "tool", tc.Function.Name)
 			trace.BadToolCall(tc.ID, tc.Function.Name,
 				map[string]any{"arguments": tc.Function.Arguments},
 				fmt.Errorf("unknown tool: %q", tc.Function.Name))
@@ -236,7 +234,7 @@ func (e *executor[Request, Response]) Execute(
 
 			// Check if any tool set the final result.
 			if !reflect.ValueOf(finalResult).IsZero() {
-				log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
+				clog.InfoContext(ctx, "Tool set final result, exiting conversation loop", "turns_completed", turn+1)
 				e.recordTurns(ctx, turn+1, false)
 				return finalResult, true, nil
 			}
@@ -247,7 +245,7 @@ func (e *executor[Request, Response]) Execute(
 
 		// When submit_result is configured, redirect text responses back to the tool.
 		if e.submitTool.Handler != nil && textContent != "" {
-			log.Warn("Model responded with text instead of calling submit_result, redirecting")
+			clog.WarnContext(ctx, "Model responded with text instead of calling submit_result, redirecting")
 			e.recordToolCall(ctx, "submit_result_redirect")
 
 			submitToolName := e.submitTool.Definition.Function.Name
@@ -269,10 +267,12 @@ func (e *executor[Request, Response]) Execute(
 		if textContent != "" {
 			resp, err := result.Extract[Response](textContent)
 			if err != nil {
-				log.With("response", textContent).With("error", err).Error("Failed to parse response")
+				clog.ErrorContext(ctx, "Failed to parse response",
+					"response", textContent,
+					"error", err)
 				return response, true, fmt.Errorf("failed to parse response: %w", err)
 			}
-			log.With("turns_completed", turn+1).Info("Successfully completed OpenAI-compatible agent execution")
+			clog.InfoContext(ctx, "Successfully completed OpenAI-compatible agent execution", "turns_completed", turn+1)
 			e.recordTurns(ctx, turn+1, false)
 			return resp, true, nil
 		}
@@ -289,7 +289,7 @@ func (e *executor[Request, Response]) Execute(
 		}
 	}
 
-	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")
+	clog.ErrorContext(ctx, "Agent exceeded maximum conversation turns", "max_turns", e.maxTurns)
 	e.recordTurns(ctx, e.maxTurns, true)
 	return response, fmt.Errorf("agent exceeded maximum conversation turns (%d)", e.maxTurns)
 }

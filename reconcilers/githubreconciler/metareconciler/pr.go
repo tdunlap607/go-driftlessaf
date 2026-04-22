@@ -20,11 +20,9 @@ import (
 // reconcilePullRequest handles PR events by finding linked issues with the required
 // label and queueing them for re-processing.
 func (r *Reconciler[Req, Resp, CB]) reconcilePullRequest(ctx context.Context, res *githubreconciler.Resource, gh *github.Client) error {
-	log := clog.FromContext(ctx)
-
 	// If no required label is configured, there's nothing to do for PRs
 	if r.requiredLabel == "" {
-		log.Debug("No required label configured, skipping PR")
+		clog.DebugContext(ctx, "No required label configured, skipping PR")
 		return nil
 	}
 
@@ -35,11 +33,11 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePullRequest(ctx context.Context, re
 	}
 
 	if len(issueURLs) == 0 {
-		log.Debug("No linked issues with required label found")
+		clog.DebugContext(ctx, "No linked issues with required label found")
 		return nil
 	}
 
-	log.With("linked_issues", len(issueURLs)).Info("Queueing linked issues for processing")
+	clog.InfoContext(ctx, "Queueing linked issues for processing", "linked_issues", len(issueURLs))
 
 	// Queue all linked issues for processing
 	keys := make([]workqueue.QueueKey, 0, len(issueURLs))

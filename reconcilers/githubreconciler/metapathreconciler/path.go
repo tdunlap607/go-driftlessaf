@@ -34,19 +34,19 @@ func (r *Reconciler[Req, Resp, CB]) reconcilePath(ctx context.Context, res *gith
 	switch {
 	case session.ShouldSkip():
 		if session.HasSkipLabel() {
-			log.With("pr", session.PRNumber()).Info("PR has skip label, not updating to preserve manual changes")
+			clog.InfoContext(ctx, "PR has skip label, not updating to preserve manual changes", "pr", session.PRNumber())
 		} else {
-			log.With("pr", session.PRNumber(), "assignees", session.Assignees()).Info("PR is assigned to humans, not updating to avoid stomping their work")
+			clog.InfoContext(ctx, "PR is assigned to humans, not updating to avoid stomping their work", "pr", session.PRNumber(), "assignees", session.Assignees())
 		}
 		return nil
 
 	// If the PR is not mergeable, ignore everything about the existing PR
 	// and start from scratch on the default branch.
 	case state.NeedsRebase():
-		log.Info("PR needs rebase, starting fresh from default branch")
+		clog.InfoContext(ctx, "PR needs rebase, starting fresh from default branch")
 
 	case state.HitMaxCommits():
-		log.Info("PR hit turn limit")
+		clog.InfoContext(ctx, "PR hit turn limit")
 		_, err := session.ApplyTurnLimit(ctx)
 		return err
 

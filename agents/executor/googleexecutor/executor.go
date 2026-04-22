@@ -122,8 +122,6 @@ func (e *executor[Request, Response]) Execute(
 	tools map[string]googletool.Metadata[Response],
 	seedToolCalls ...*genai.FunctionCall,
 ) (resp Response, err error) {
-	log := clog.FromContext(ctx)
-
 	// Guard against incompatible combination: thinking mode + seed tool calls.
 	// When ThinkingConfig is set, Gemini requires that model turns with FunctionCall
 	// parts also include Thought parts. Synthetic seed turns have no Thought parts,
@@ -271,14 +269,14 @@ func (e *executor[Request, Response]) Execute(
 
 	// Execute seed tool calls and build complete history
 	for _, call := range seedToolCalls {
-		log.With("tool", call.Name).With("id", call.ID).Info("Pre-executing seed tool call")
+		clog.InfoContext(ctx, "Pre-executing seed tool call", "tool", call.Name, "id", call.ID)
 
 		// Execute the tool call
 		var result *genai.FunctionResponse
 		if meta, ok := tools[call.Name]; ok {
 			result = meta.Handler(ctx, call, trace, finalResultPtr)
 		} else {
-			log.With("tool", call.Name).Error("Unknown seed tool requested")
+			clog.ErrorContext(ctx, "Unknown seed tool requested", "tool", call.Name)
 			trace.BadToolCall(call.ID, call.Name, call.Args, fmt.Errorf("unknown tool: %q", call.Name))
 			result = &genai.FunctionResponse{
 				ID:   call.ID,
@@ -291,7 +289,7 @@ func (e *executor[Request, Response]) Execute(
 
 		// Check if a tool set the final result during seed execution
 		if !reflect.ValueOf(finalResult).IsZero() {
-			log.Info("Seed tool set final result, exiting immediately")
+			clog.InfoContext(ctx, "Seed tool set final result, exiting immediately")
 			return finalResult, nil
 		}
 
@@ -316,7 +314,7 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	// Send final message to get response with retry for transient errors
-	log.Info("Sending final message")
+	clog.InfoContext(ctx, "Sending final message")
 	response, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_initial_message", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
 		return chat.Send(ctx, history[len(history)-1].Parts...)
 	})
@@ -353,8 +351,7 @@ func (e *executor[Request, Response]) Execute(
 			)
 		}
 
-		log.With("candidates_count", len(response.Candidates)).
-			Info("Received response from model")
+		clog.InfoContext(ctx, "Received response from model", "candidates_count", len(response.Candidates))
 
 		if len(response.Candidates) == 0 {
 			return zero, nil, true, errors.New("no content generated - no candidates")
@@ -364,8 +361,8 @@ func (e *executor[Request, Response]) Execute(
 
 		// Check for malformed function call
 		if candidate.FinishReason == genai.FinishReasonMalformedFunctionCall {
-			log.With("finish_message", candidate.FinishMessage).
-				Warn("Model attempted a malformed function call, asking it to retry")
+			clog.WarnContext(ctx, "Model attempted a malformed function call, asking it to retry",
+				"finish_message", candidate.FinishMessage)
 
 			// Build available function names for retry message
 			var funcNames []string
@@ -414,24 +411,23 @@ func (e *executor[Request, Response]) Execute(
 				trace.Reasoning = append(trace.Reasoning, agenttrace.ReasoningContent{
 					Thinking: part.Text,
 				})
-				log.With("part_index", i).
-					With("thinking_length", len(part.Text)).
-					Info("Found thought part")
+				clog.InfoContext(ctx, "Found thought part",
+					"part_index", i,
+					"thinking_length", len(part.Text))
 			case part.Text != "":
 				responseText = part.Text
 				hasText = true
-				log.With("part_index", i).
-					With("text_length", len(part.Text)).
-					Info("Found text part")
+				clog.InfoContext(ctx, "Found text part",
+					"part_index", i,
+					"text_length", len(part.Text))
 			case part.FunctionCall != nil:
 				toolCalls = append(toolCalls, part.FunctionCall)
-				log.With("part_index", i).
-					With("function_name", part.FunctionCall.Name).
-					With("function_id", part.FunctionCall.ID).
-					Info("Found function call part")
+				clog.InfoContext(ctx, "Found function call part",
+					"part_index", i,
+					"function_name", part.FunctionCall.Name,
+					"function_id", part.FunctionCall.ID)
 			default:
-				log.With("part_index", i).
-					Warn("Found part with unexpected content")
+				clog.WarnContext(ctx, "Found part with unexpected content", "part_index", i)
 			}
 		}
 
@@ -440,11 +436,11 @@ func (e *executor[Request, Response]) Execute(
 			var toolResponseParts []*genai.Part
 
 			for _, call := range toolCalls {
-				l := log.With("tool", call.Name).With("id", call.ID)
+				kvs := []any{"tool", call.Name, "id", call.ID}
 				for k, v := range call.Args {
-					l = l.With("args."+k, v)
+					kvs = append(kvs, "args."+k, v)
 				}
-				l.Info("Executing tool call")
+				clog.InfoContext(ctx, "Executing tool call", kvs...)
 
 				// Record tool call metric
 				e.recordToolCall(ctx, call.Name)
@@ -453,7 +449,7 @@ func (e *executor[Request, Response]) Execute(
 				var toolResponse *genai.FunctionResponse
 				toolMeta, found := tools[call.Name]
 				if !found {
-					log.With("function", call.Name).Error("Unknown function call requested by model")
+					clog.ErrorContext(ctx, "Unknown function call requested by model", "function", call.Name)
 					toolResponse = googletool.Error(call, "Unknown function: %s", call.Name)
 
 					// Record bad tool call for unknown function
@@ -465,7 +461,7 @@ func (e *executor[Request, Response]) Execute(
 
 				// Check if a tool set the final result
 				if !reflect.ValueOf(finalResult).IsZero() {
-					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
+					clog.InfoContext(ctx, "Tool set final result, exiting conversation loop", "turns_completed", turn+1)
 					e.recordTurns(ctx, turn+1, false)
 					return finalResult, nil, true, nil
 				}
@@ -498,7 +494,7 @@ func (e *executor[Request, Response]) Execute(
 		// If the model responds with text instead of calling submit_result,
 		// redirect it back to use the tool.
 		if e.submitTool.Handler != nil && hasText {
-			log.Warn("Model responded with text instead of calling submit_result, redirecting")
+			clog.WarnContext(ctx, "Model responded with text instead of calling submit_result, redirecting")
 			e.recordToolCall(ctx, "submit_result_redirect")
 
 			redirectResp, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_submit_redirect", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
@@ -525,16 +521,18 @@ func (e *executor[Request, Response]) Execute(
 		if hasText {
 			extractedResponse, err := result.Extract[Response](responseText)
 			if err != nil {
-				log.With("response", responseText).With("error", err).Error("Failed to parse AI response")
+				clog.ErrorContext(ctx, "Failed to parse AI response",
+					"response", responseText,
+					"error", err)
 				return zero, nil, true, fmt.Errorf("failed to parse AI response: %w", err)
 			}
-			log.With("turns_completed", turn+1).Info("Successfully completed Google AI agent execution")
+			clog.InfoContext(ctx, "Successfully completed Google AI agent execution", "turns_completed", turn+1)
 			e.recordTurns(ctx, turn+1, false)
 			return extractedResponse, nil, true, nil
 		}
 
 		// Unexpected state
-		log.Error("Unexpected response format - no text and no tool calls")
+		clog.ErrorContext(ctx, "Unexpected response format - no text and no tool calls")
 		return zero, nil, true, errors.New("unexpected response format from model")
 	}
 
@@ -551,7 +549,7 @@ func (e *executor[Request, Response]) Execute(
 		response = nextResp
 	}
 
-	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")
+	clog.ErrorContext(ctx, "Agent exceeded maximum conversation turns", "max_turns", e.maxTurns)
 	e.recordTurns(ctx, e.maxTurns, true)
 	return resp, fmt.Errorf("agent exceeded maximum conversation turns (%d)", e.maxTurns)
 }

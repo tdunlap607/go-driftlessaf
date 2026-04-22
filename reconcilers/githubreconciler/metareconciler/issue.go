@@ -42,25 +42,25 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, res *git
 	switch {
 	case changeSession.ShouldSkip(creator):
 		if changeSession.HasSkipLabel() {
-			log.With("pr", changeSession.PRNumber()).Info("PR has skip label, not updating to preserve manual changes")
+			clog.InfoContext(ctx, "PR has skip label, not updating to preserve manual changes", "pr", changeSession.PRNumber())
 		} else {
-			log.With("pr", changeSession.PRNumber(), "assignees", changeSession.Assignees()).Info("PR is assigned to humans, not updating to avoid stomping their work")
+			clog.InfoContext(ctx, "PR is assigned to humans, not updating to avoid stomping their work", "pr", changeSession.PRNumber(), "assignees", changeSession.Assignees())
 		}
 		return nil
 
 	case r.requiredLabel != "" && !hasLabel(issue, r.requiredLabel):
-		log.With("required_label", r.requiredLabel).Info("Issue missing required label, closing any outstanding PRs")
+		clog.InfoContext(ctx, "Issue missing required label, closing any outstanding PRs", "required_label", r.requiredLabel)
 		return changeSession.CloseAnyOutstanding(ctx, "Closing PR because the issue no longer has the required label.")
 
 	case issue.GetState() == "closed":
-		log.Info("Issue is closed, closing any outstanding PRs")
+		clog.InfoContext(ctx, "Issue is closed, closing any outstanding PRs")
 		return changeSession.CloseAnyOutstanding(ctx, "Closing PR because the issue was closed.")
 
 	case state.NeedsRebase():
-		log.Info("PR needs rebase, starting fresh from default branch")
+		clog.InfoContext(ctx, "PR needs rebase, starting fresh from default branch")
 
 	case state.HitMaxCommits():
-		log.Info("PR hit turn limit")
+		clog.InfoContext(ctx, "PR hit turn limit")
 		_, err := changeSession.ApplyTurnLimit(ctx)
 		return err
 

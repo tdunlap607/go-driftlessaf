@@ -111,8 +111,6 @@ func (e *executor[Request, Response]) Execute(
 	tools map[string]claudetool.Metadata[Response],
 	seedToolCalls ...anthropic.ToolUseBlock,
 ) (response Response, err error) {
-	log := clog.FromContext(ctx)
-
 	// Bind the request to the prompt
 	boundPrompt, err := request.Bind(e.prompt)
 	if err != nil {
@@ -265,15 +263,14 @@ func (e *executor[Request, Response]) Execute(
 
 	// executeToolCall handles executing a single tool call and returning the result
 	executeToolCall := func(toolUse anthropic.ToolUseBlock) (anthropic.ContentBlockParamUnion, error) {
-		l := log.With("tool", toolUse.Name).
-			With("id", toolUse.ID)
+		kvs := []any{"tool", toolUse.Name, "id", toolUse.ID}
 		var args map[string]any
 		if err := json.Unmarshal(toolUse.Input, &args); err == nil {
 			for k, v := range args {
-				l = l.With("args."+k, v)
+				kvs = append(kvs, "args."+k, v)
 			}
 		}
-		l.Info("Executing tool call")
+		clog.InfoContext(ctx, "Executing tool call", kvs...)
 
 		var result map[string]any
 
@@ -282,7 +279,7 @@ func (e *executor[Request, Response]) Execute(
 			result = meta.Handler(ctx, toolUse, trace, finalResultPtr)
 		} else {
 			// Unknown tool
-			log.With("tool", toolUse.Name).Error("Unknown tool requested")
+			clog.ErrorContext(ctx, "Unknown tool requested", "tool", toolUse.Name)
 			trace.BadToolCall(toolUse.ID, toolUse.Name,
 				map[string]any{"input": toolUse.Input},
 				fmt.Errorf("unknown tool: %q", toolUse.Name))
@@ -332,7 +329,7 @@ func (e *executor[Request, Response]) Execute(
 
 		// Check if a tool set the final result during seed execution
 		if !reflect.ValueOf(finalResult).IsZero() {
-			log.Info("Seed tool set final result, exiting immediately")
+			clog.InfoContext(ctx, "Seed tool set final result, exiting immediately")
 			e.recordTurns(ctx, 0, false)
 			return finalResult, nil
 		}
@@ -391,8 +388,9 @@ func (e *executor[Request, Response]) Execute(
 			if cacheRead > 0 || cacheCreation > 0 {
 				e.recordCacheMetrics(ctx, cacheRead, cacheCreation)
 				trace.RecordCacheTokenUsage(cacheRead, cacheCreation)
-				log.With("cache_read_tokens", cacheRead, "cache_creation_tokens", cacheCreation).
-					Info("Prompt cache metrics")
+				clog.InfoContext(ctx, "Prompt cache metrics",
+					"cache_read_tokens", cacheRead,
+					"cache_creation_tokens", cacheCreation)
 			}
 		}
 
@@ -439,7 +437,7 @@ func (e *executor[Request, Response]) Execute(
 
 				// Check if a tool set the final result
 				if !reflect.ValueOf(finalResult).IsZero() {
-					log.With("turns_completed", turn+1).Info("Tool set final result, exiting conversation loop")
+					clog.InfoContext(ctx, "Tool set final result, exiting conversation loop", "turns_completed", turn+1)
 					e.recordTurns(ctx, turn+1, false)
 					return finalResult, true, nil
 				}
@@ -458,7 +456,7 @@ func (e *executor[Request, Response]) Execute(
 		// If Claude responds with text instead of calling submit_result,
 		// force it to call the tool on the next turn using tool_choice.
 		if e.submitTool.Handler != nil && textContent != "" {
-			log.Warn("Claude responded with text instead of calling submit_result, redirecting with tool_choice")
+			clog.WarnContext(ctx, "Claude responded with text instead of calling submit_result, redirecting with tool_choice")
 			e.recordToolCall(ctx, "submit_result_redirect")
 
 			submitToolName := e.submitTool.Definition.Name
@@ -482,13 +480,13 @@ func (e *executor[Request, Response]) Execute(
 		if textContent != "" {
 			resp, err := result.Extract[Response](textContent)
 			if err != nil {
-				log.With("response", textContent).
-					With("error", err).
-					Error("Failed to parse Claude response")
+				clog.ErrorContext(ctx, "Failed to parse Claude response",
+					"response", textContent,
+					"error", err)
 				return response, true, fmt.Errorf("failed to parse response: %w", err)
 			}
 
-			log.With("turns_completed", turn+1).Info("Successfully completed Claude agent execution")
+			clog.InfoContext(ctx, "Successfully completed Claude agent execution", "turns_completed", turn+1)
 			e.recordTurns(ctx, turn+1, false)
 			return resp, true, nil
 		}
@@ -506,7 +504,7 @@ func (e *executor[Request, Response]) Execute(
 		}
 	}
 
-	log.With("max_turns", e.maxTurns).Error("Agent exceeded maximum conversation turns")
+	clog.ErrorContext(ctx, "Agent exceeded maximum conversation turns", "max_turns", e.maxTurns)
 	e.recordTurns(ctx, e.maxTurns, true)
 	return response, fmt.Errorf("agent exceeded maximum conversation turns (%d)", e.maxTurns)
 }

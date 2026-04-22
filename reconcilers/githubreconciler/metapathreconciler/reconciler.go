@@ -178,8 +178,6 @@ func New[Req promptbuilder.Bindable, Resp Result, CB any](
 // For paths: runs the analyzer and agent to create/update a PR.
 // For PRs: extracts the original path from the branch name and queues it.
 func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, res *githubreconciler.Resource, gh *github.Client) error {
-	log := clog.FromContext(ctx)
-
 	switch res.Type {
 	case githubreconciler.ResourceTypePath:
 		if !r.mode.ShouldFix() && !r.mode.IsConfig() {
@@ -189,7 +187,7 @@ func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, res *githubre
 	case githubreconciler.ResourceTypePullRequest:
 		return r.reconcilePullRequest(ctx, res, gh)
 	default:
-		log.With("type", res.Type).Warn("Unexpected resource type")
+		clog.WarnContext(ctx, "Unexpected resource type", "type", res.Type)
 		return nil
 	}
 }

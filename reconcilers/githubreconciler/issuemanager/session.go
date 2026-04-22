@@ -281,7 +281,7 @@ func (s *IssueSession[T]) createIssue(ctx context.Context, data *T, pathLabel st
 	allLabels = append(allLabels, recLabels...)
 	allLabels = append(allLabels, extralabels...)
 
-	log.Info("Creating new issue")
+	clog.InfoContext(ctx, "Creating new issue")
 
 	issue, _, err := s.client.Issues.Create(ctx, s.owner, s.repo, &github.IssueRequest{
 		Title:  github.Ptr(title),
