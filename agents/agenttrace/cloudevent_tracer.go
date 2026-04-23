@@ -34,26 +34,25 @@ const (
 // does not delay the reconciler. Call Drain to flush in-flight events
 // before process exit.
 type ceEmittingTracer[T any] struct {
-	inner     Tracer[T]
-	client    cloudevents.Client
-	eventType string
-	source    string
-	eg        errgroup.Group
+	inner  Tracer[T]
+	client cloudevents.Client
+	source string
+	eg     errgroup.Group
 }
 
 // WithCloudEventEmission wraps inner so that each call to RecordTrace also
 // emits the trace as a CloudEvent. The caller provides a pre-built
-// cloudevents.Client (see NewBrokerClient), the CloudEvent type string,
-// and a source identifier (e.g. "github-pr-autofix-reconciler").
+// cloudevents.Client (see NewBrokerClient) and a source identifier
+// (e.g. the OCTO_IDENTITY of the reconciler). The CloudEvent type is
+// always EventType.
 //
 // Call Drain on the returned tracer (via type assertion) before process
 // exit to flush in-flight events.
-func WithCloudEventEmission[T any](inner Tracer[T], client cloudevents.Client, eventType, source string) Tracer[T] {
+func WithCloudEventEmission[T any](inner Tracer[T], client cloudevents.Client, source string) Tracer[T] {
 	t := &ceEmittingTracer[T]{
-		inner:     inner,
-		client:    client,
-		eventType: eventType,
-		source:    source,
+		inner:  inner,
+		client: client,
+		source: source,
 	}
 	t.eg.SetLimit(ceMaxInflight)
 	return t
@@ -71,7 +70,7 @@ func (t *ceEmittingTracer[T]) RecordTrace(trace *Trace[T]) {
 
 	ce := cloudevents.NewEvent()
 	ce.SetID(trace.ID)
-	ce.SetType(t.eventType)
+	ce.SetType(EventType)
 	ce.SetSource(t.source)
 	ce.SetSubject(trace.ExecContext.ReconcilerKey)
 	ce.SetTime(trace.StartTime)

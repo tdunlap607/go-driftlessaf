@@ -46,7 +46,7 @@ func TestWithCloudEventEmission_DelegatesToInner(t *testing.T) {
 		t.Fatalf("creating test CE client: %v", err)
 	}
 
-	wrapped := WithCloudEventEmission[string](inner, client, EventType, "test-source")
+	wrapped := WithCloudEventEmission[string](inner, client, "test-source")
 
 	ctx := WithExecutionContext(t.Context(), ExecutionContext{
 		ReconcilerKey:  "pr:owner/repo/42",
@@ -89,7 +89,7 @@ func TestWithCloudEventEmission_EmitsCloudEvent(t *testing.T) {
 	}
 
 	inner := ByCode[string](func(_ *Trace[string]) {})
-	wrapped := WithCloudEventEmission[string](inner, client, EventType, "test-reconciler")
+	wrapped := WithCloudEventEmission[string](inner, client, "test-reconciler")
 
 	ctx := WithExecutionContext(t.Context(), ExecutionContext{
 		ReconcilerKey:  "pr:owner/repo/42",
@@ -173,7 +173,7 @@ func TestWithCloudEventEmission_ErrorSerializesAsString(t *testing.T) {
 	}
 
 	inner := ByCode[string](func(_ *Trace[string]) {})
-	wrapped := WithCloudEventEmission[string](inner, client, EventType, "test-source")
+	wrapped := WithCloudEventEmission[string](inner, client, "test-source")
 
 	ctx := WithTracer[string](t.Context(), wrapped)
 	_, done := StartTrace[string](ctx, "prompt")
