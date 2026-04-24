@@ -21,6 +21,50 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
+// maxPayloadBytes is the maximum byte length for a payload attribute emitted
+// on the root invoke_agent span. Both Braintrust and Langfuse ingest reject
+// ~1 MB+ batches, so fixer prompts / completions that exceed this get
+// truncated with a braintrust.metadata.truncated=true marker.
+const maxPayloadBytes = 64 * 1024
+
+// Canonical gen_ai.system values per the OpenTelemetry GenAI semantic
+// conventions. Executors pass these to BeginTurn so downstream eval tools
+// (Braintrust, Langfuse, …) can filter traces by provider without
+// consumers needing to remember the exact spelling.
+const (
+	SystemAnthropic    = "anthropic"
+	SystemGoogleVertex = "google.vertex"
+	SystemOpenAI       = "openai"
+)
+
+// StartTraceOption configures trace creation. Options let callers attach
+// an agent name (static, for gen_ai.agent.name) and a dynamic name function
+// (for braintrust.span_attributes.name — e.g. "autofix: pr:chainguard-dev/mono#38632").
+type StartTraceOption func(*traceOptions)
+
+type traceOptions struct {
+	agentName string
+	nameFn    func(ExecutionContext) string
+}
+
+// WithAgentName sets the static gen_ai.agent.name attribute on the root
+// invoke_agent span (e.g. "loganalyzer", "judge", "fixer"). Also used as
+// the fallback for braintrust.span_attributes.name when no nameFn is set.
+func WithAgentName(name string) StartTraceOption {
+	return func(o *traceOptions) {
+		o.agentName = name
+	}
+}
+
+// WithNameFn sets a callback that produces the braintrust.span_attributes.name
+// attribute (the label shown in the Braintrust UI) from the ExecutionContext.
+// When nil or unset, braintrust.span_attributes.name falls back to agentName.
+func WithNameFn(fn func(ExecutionContext) string) StartTraceOption {
+	return func(o *traceOptions) {
+		o.nameFn = fn
+	}
+}
+
 // ReasoningContent represents internal reasoning from an LLM
 type ReasoningContent struct {
 	Thinking string `json:"thinking"`
@@ -86,12 +130,37 @@ type Trace[T any] struct {
 // newTrace creates a new trace for the given prompt. The context must
 // already contain a tracer (via WithTracer or StartTrace); Complete
 // will panic otherwise.
-func newTrace[T any](ctx context.Context, prompt string) *Trace[T] {
+func newTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
+	// Seed options from context defaults so a reconciler that wrapped the
+	// context with WithDefaultAgentName / WithDefaultNameFn gets its naming
+	// applied to every executor-driven trace without threading options
+	// through every intermediate call site. Explicit opts below still win.
+	o := traceOptions{
+		agentName: GetDefaultAgentName(ctx),
+		nameFn:    GetDefaultNameFn(ctx),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
+		}
+	}
+
 	// Extract execution context from Go context
 	execCtx := GetExecutionContext(ctx)
 
 	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
 		oteltrace.WithInstrumentationVersion("1.0.0"))
+
+	// Compute the Braintrust-facing span name. braintrust.span_attributes.name
+	// drives the label in the Braintrust UI. nameFn wins for PR-aware labels
+	// ("autofix: pr:chainguard-dev/mono#38632"); otherwise fall back to the
+	// static agent name.
+	btName := o.agentName
+	if o.nameFn != nil {
+		if n := o.nameFn(execCtx); n != "" {
+			btName = n
+		}
+	}
 
 	// Add execution context as span attributes.
 	// Include both custom attributes and OpenTelemetry GenAI semantic conventions (gen_ai.*).
@@ -103,6 +172,12 @@ func newTrace[T any](ctx context.Context, prompt string) *Trace[T] {
 			attribute.String("gen_ai.operation.name", "invoke_agent"),
 		),
 	}
+	if o.agentName != "" {
+		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("gen_ai.agent.name", o.agentName)))
+	}
+	if btName != "" {
+		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("braintrust.span_attributes.name", btName)))
+	}
 	if execCtx.ReconcilerKey != "" {
 		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("reconciler_key", execCtx.ReconcilerKey)))
 	}
@@ -111,6 +186,27 @@ func newTrace[T any](ctx context.Context, prompt string) *Trace[T] {
 	}
 	if execCtx.CommitSHA != "" {
 		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("commit_sha", execCtx.CommitSHA)))
+	}
+
+	// Payload emission (gen_ai.prompt + gen_ai.input.messages) is gated on
+	// the WithPayloadsEnabled ctx opt-in. Staging can opt in; prod stays off
+	// pending security review because prompts may contain build-log tokens
+	// and internal URLs. Dual-emit both the Langfuse-compatible (gen_ai.prompt)
+	// and Braintrust / OTel-semconv-compatible (gen_ai.input.messages) keys
+	// so either backend picks up the payload with zero code revisit.
+	if payloadsEnabledFrom(ctx) && prompt != "" {
+		if payload, err := json.Marshal([]map[string]string{{"role": "user", "content": prompt}}); err == nil {
+			payloadStr, truncated := truncatePayload(string(payload))
+			spanAttrs = append(spanAttrs, oteltrace.WithAttributes(
+				attribute.String("gen_ai.prompt", payloadStr),
+				attribute.String("gen_ai.input.messages", payloadStr),
+			))
+			if truncated {
+				spanAttrs = append(spanAttrs, oteltrace.WithAttributes(
+					attribute.Bool("braintrust.metadata.truncated", true),
+				))
+			}
+		}
 	}
 
 	ctx, span := tr.Start(ctx, "invoke_agent", spanAttrs...)
@@ -133,14 +229,27 @@ func newTrace[T any](ctx context.Context, prompt string) *Trace[T] {
 	}
 }
 
+// truncatePayload truncates a payload string to maxPayloadBytes and reports
+// whether truncation occurred. Byte-based (not rune-based) because the
+// constraint is on the OTLP batch size, not logical content.
+func truncatePayload(s string) (string, bool) {
+	if len(s) <= maxPayloadBytes {
+		return s, false
+	}
+	return s[:maxPayloadBytes], true
+}
+
 // BeginTurn starts a new LLM turn span as a child of the trace span.
 // The trace context is updated so subsequent tool call spans are nested under
 // this turn span. Call End() on the returned LLMTurn when the turn completes.
 //
+// system is the OTel GenAI provider identifier: "openai", "anthropic",
+// "google.vertex", etc. It powers provider filtering in eval tools.
+//
 // Callers MUST call End() on the current turn before calling BeginTurn again.
 // Overlapping turns corrupt the span hierarchy: the later End() restores a
 // stale context, causing subsequent spans to be parented incorrectly.
-func (t *Trace[T]) BeginTurn(turn int, modelName string) *LLMTurn[T] {
+func (t *Trace[T]) BeginTurn(turn int, system, modelName string) *LLMTurn[T] {
 	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
 		oteltrace.WithInstrumentationVersion("1.0.0"))
 
@@ -148,12 +257,17 @@ func (t *Trace[T]) BeginTurn(turn int, modelName string) *LLMTurn[T] {
 	parentCtx := t.ctx
 	t.mu.Unlock()
 
+	attrs := []attribute.KeyValue{
+		attribute.String("gen_ai.operation.name", "chat"),
+		attribute.String("gen_ai.request.model", modelName),
+		attribute.Int("driftlessaf.turn.index", turn),
+	}
+	if system != "" {
+		attrs = append(attrs, attribute.String("gen_ai.system", system))
+	}
+
 	newCtx, span := tr.Start(parentCtx, "chat "+modelName,
-		oteltrace.WithAttributes(
-			attribute.String("gen_ai.operation.name", "chat"),
-			attribute.String("gen_ai.request.model", modelName),
-			attribute.Int("driftlessaf.turn.index", turn),
-		))
+		oteltrace.WithAttributes(attrs...))
 
 	t.mu.Lock()
 	t.ctx = newCtx
@@ -235,9 +349,13 @@ func (t *Trace[T]) StartToolCall(id, name string, params map[string]any) *ToolCa
 // This allows viewing token consumption directly in Cloud Trace without needing to
 // cross-reference with metrics.
 //
-// Attributes are emitted in both custom format (model, tokens.input, tokens.output)
-// and OpenTelemetry GenAI semantic conventions (gen_ai.request.model, gen_ai.usage.input_tokens,
-// gen_ai.usage.output_tokens).
+// Token counts are emitted on the root invoke_agent span via OpenTelemetry GenAI
+// semantic conventions (gen_ai.usage.input_tokens / gen_ai.usage.output_tokens)
+// alongside legacy custom attributes. gen_ai.request.model is NOT emitted on the
+// root span — per OTel GenAI semconv it's a turn-level concern, emitted on the
+// "chat <model>" spans in BeginTurn. Langfuse reclassifies any root span carrying
+// gen_ai.request.model as a "generation" observation, which is wrong for an
+// orchestration span; Braintrust doesn't reclassify but semantically agrees.
 // See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
 func (t *Trace[T]) RecordTokenUsage(model string, inputTokens, outputTokens int64) {
 	t.mu.Lock()
@@ -256,8 +374,8 @@ func (t *Trace[T]) RecordTokenUsage(model string, inputTokens, outputTokens int6
 			attribute.Int64("tokens.input", inputTokens),
 			attribute.Int64("tokens.output", outputTokens),
 			attribute.Int64("tokens.total", inputTokens+outputTokens),
-			// OpenTelemetry GenAI semantic conventions
-			attribute.String("gen_ai.request.model", model),
+			// OpenTelemetry GenAI semantic conventions (token usage only —
+			// model is a turn-level concern, emitted in BeginTurn)
 			attribute.Int64("gen_ai.usage.input_tokens", inputTokens),
 			attribute.Int64("gen_ai.usage.output_tokens", outputTokens),
 		)
@@ -376,6 +494,23 @@ func (t *Trace[T]) complete(result T, err error) {
 	t.mu.Unlock()
 
 	if span != nil {
+		// Emit the final result payload on the root invoke_agent span before
+		// ending it. Dual-emit both the Langfuse-compatible (gen_ai.completion)
+		// and Braintrust / OTel-semconv-compatible (gen_ai.output.messages)
+		// keys so either backend auto-populates the output field. Gated on
+		// the WithPayloadsEnabled ctx opt-in — same reasoning as prompt emission.
+		if payloadsEnabledFrom(t.ctx) && err == nil {
+			if payload, mErr := json.Marshal(result); mErr == nil && len(payload) > 0 && string(payload) != "null" {
+				payloadStr, truncated := truncatePayload(string(payload))
+				span.SetAttributes(
+					attribute.String("gen_ai.completion", payloadStr),
+					attribute.String("gen_ai.output.messages", payloadStr),
+				)
+				if truncated {
+					span.SetAttributes(attribute.Bool("braintrust.metadata.truncated", true))
+				}
+			}
+		}
 		if err != nil {
 			span.RecordError(err)
 			span.SetStatus(codes.Error, err.Error())

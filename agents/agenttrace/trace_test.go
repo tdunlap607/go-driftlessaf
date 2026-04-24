@@ -276,7 +276,7 @@ func TestLLMTurnBeginAndEnd(t *testing.T) {
 	originalCtx := trace.ctx
 
 	// BeginTurn should replace trace.ctx with the turn's context.
-	turn := trace.BeginTurn(0, "test-model")
+	turn := trace.BeginTurn(0, "test-system", "test-model")
 	if turn == nil {
 		t.Fatal("BeginTurn: got = nil, wanted = non-nil LLMTurn")
 	}
@@ -295,7 +295,7 @@ func TestLLMTurnEndIdempotent(t *testing.T) {
 	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
 	trace := tracer.NewTrace(t.Context(), randomString())
 
-	turn := trace.BeginTurn(0, "test-model")
+	turn := trace.BeginTurn(0, "test-system", "test-model")
 	savedCtx := trace.ctx
 
 	// First End restores context.
@@ -305,7 +305,7 @@ func TestLLMTurnEndIdempotent(t *testing.T) {
 	}
 
 	// Begin a second turn to change ctx again, then call End twice on first turn.
-	turn2 := trace.BeginTurn(1, "test-model")
+	turn2 := trace.BeginTurn(1, "test-system", "test-model")
 	afterTurn2Ctx := trace.ctx
 
 	// Second call to the first turn's End must be a no-op — must not overwrite
@@ -330,7 +330,7 @@ func TestLLMTurnRecordTokens(t *testing.T) {
 	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
 	trace := tracer.NewTrace(t.Context(), randomString())
 
-	turn := trace.BeginTurn(0, "test-model")
+	turn := trace.BeginTurn(0, "test-system", "test-model")
 	turn.RecordTokens(1000, 200)
 	turn.End()
 
@@ -376,11 +376,11 @@ func TestBeginTurnBeforeEnd(t *testing.T) {
 	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
 	trace := tracer.NewTrace(t.Context(), randomString())
 
-	turn1 := trace.BeginTurn(0, "test-model")
+	turn1 := trace.BeginTurn(0, "test-system", "test-model")
 	afterTurn1Ctx := trace.ctx
 
 	// Begin turn2 without ending turn1 — violates the contract.
-	turn2 := trace.BeginTurn(1, "test-model")
+	turn2 := trace.BeginTurn(1, "test-system", "test-model")
 	afterTurn2Ctx := trace.ctx
 
 	// turn2 should be a child of the turn1 context (not the trace root),

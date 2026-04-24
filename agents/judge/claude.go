@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 
+	"chainguard.dev/driftlessaf/agents/agenttrace"
 	"chainguard.dev/driftlessaf/agents/executor/claudeexecutor"
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/vertex"
@@ -131,6 +132,11 @@ func (c *claude) Judge(ctx context.Context, request *Request) (*Judgement, error
 	default:
 		return nil, fmt.Errorf("unsupported mode: %q", request.Mode)
 	}
+
+	// Stamp the agent name so the executor-layer trace carries
+	// gen_ai.agent.name=judge on its root invoke_agent span. See
+	// agenttrace.WithDefaultAgentName.
+	ctx = agenttrace.WithDefaultAgentName(ctx, "judge")
 
 	// Execute with selected executor
 	return executor.Execute(ctx, request, nil)

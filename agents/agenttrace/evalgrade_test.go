@@ -1,0 +1,310 @@
+/*
+Copyright 2026 Chainguard, Inc.
+SPDX-License-Identifier: Apache-2.0
+*/
+
+package agenttrace
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/google/go-cmp/cmp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	noop "go.opentelemetry.io/otel/trace/noop"
+)
+
+// findSpan returns the first recorded span with the given name, or nil.
+func findSpan(spans []sdktrace.ReadOnlySpan, name string) sdktrace.ReadOnlySpan {
+	for _, s := range spans {
+		if s.Name() == name {
+			return s
+		}
+	}
+	return nil
+}
+
+// findAttr returns the first attribute with the given key on the span, or nil.
+// A pointer return lets callers distinguish "attribute missing" from "attribute
+// present with zero value".
+func findAttr(s sdktrace.ReadOnlySpan, key string) *attribute.KeyValue {
+	for _, a := range s.Attributes() {
+		if string(a.Key) == key {
+			kv := a
+			return &kv
+		}
+	}
+	return nil
+}
+
+// present marks attributes in a want map whose value isn't asserted — only
+// presence. Pair it with anyValue in a cmp.Diff call.
+type present struct{}
+
+// attrsAsMap collapses a span's attributes into a key/value map for
+// whole-value equality assertions via cmp.Diff.
+func attrsAsMap(s sdktrace.ReadOnlySpan) map[string]any {
+	attrs := s.Attributes()
+	m := make(map[string]any, len(attrs))
+	for _, kv := range attrs {
+		m[string(kv.Key)] = kv.Value.AsInterface()
+	}
+	return m
+}
+
+// anyValue treats a want-side `present{}` marker as equal to any got-side
+// value of the same key. Use it with cmp.Diff so callers that only care
+// about presence (not the exact payload contents) don't have to assert
+// twice.
+var anyValue = cmp.FilterValues(
+	func(x, _ any) bool { _, ok := x.(present); return ok },
+	cmp.Ignore(),
+)
+
+// setupRecorder installs a SpanRecorder as the global TracerProvider for the
+// duration of the test and returns it. Any span started via otel.Tracer(...)
+// during the test lands in the recorder. On cleanup the global provider is
+// reset to the noop implementation — matching the package default so other
+// tests in this file (e.g. TestTraceMarshalJSON / "noop provider omits
+// otel_trace_id") see a span context with no trace ID.
+func setupRecorder(t *testing.T) *tracetest.SpanRecorder {
+	t.Helper()
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(noop.NewTracerProvider()) })
+	return sr
+}
+
+// driveAgentTrace creates a root invoke_agent span, opens one turn with the
+// given system + model, records token usage, and completes the trace with
+// the supplied result. It mirrors the minimum surface an executor exercises.
+// Callers that want payload emission on the root span pass a ctx wrapped
+// with WithPayloadsEnabled; the default ctx leaves payloads off.
+func driveAgentTrace[T any](t *testing.T, ctx context.Context, spanName, system, model string, result T, opts ...StartTraceOption) {
+	t.Helper()
+	ctx = WithExecutionContext(ctx, ExecutionContext{
+		ReconcilerKey:  "pr:chainguard-dev/mono/38632",
+		ReconcilerType: "pr",
+	})
+	trace, done := StartTrace[T](ctx, spanName, opts...)
+	turn := trace.BeginTurn(0, system, model)
+	turn.RecordTokens(1000, 200)
+	trace.RecordTokenUsage(model, 1000, 200)
+	turn.End()
+	done(result, nil)
+}
+
+// TestPayloadsEnabled verifies that when WithPayloadsEnabled(ctx, true) is
+// set, the root invoke_agent span carries both the Langfuse-compatible and
+// Braintrust / OTel-semconv-compatible payload attribute pairs, the agent
+// name and dynamic name labels, and token usage; and that the turn span
+// carries gen_ai.system alongside gen_ai.request.model. It also asserts
+// that gen_ai.request.model is NOT emitted on the root span — the absence
+// falls out of the whole-map comparison for free.
+func TestPayloadsEnabled(t *testing.T) {
+	sr := setupRecorder(t)
+
+	result := map[string]any{"summary": "ok", "failures": []string{}}
+	driveAgentTrace(t, WithPayloadsEnabled(t.Context(), true), "analyze these logs", "google.vertex", "gemini-2.5-flash", result,
+		WithAgentName("loganalyzer"),
+		WithNameFn(func(ec ExecutionContext) string { return "autofix: " + ec.ReconcilerKey }),
+	)
+
+	spans := sr.Ended()
+	root := findSpan(spans, "invoke_agent gemini-2.5-flash")
+	if root == nil {
+		t.Fatalf("root invoke_agent span not found; got %d spans", len(spans))
+	}
+
+	wantRoot := map[string]any{
+		"agent.prompt":                    "analyze these logs",
+		"gen_ai.operation.name":           "invoke_agent",
+		"gen_ai.agent.name":               "loganalyzer",
+		"braintrust.span_attributes.name": "autofix: pr:chainguard-dev/mono/38632",
+		"reconciler_key":                  "pr:chainguard-dev/mono/38632",
+		"reconciler_type":                 "pr",
+		"gen_ai.prompt":                   present{},
+		"gen_ai.input.messages":           present{},
+		"gen_ai.completion":               present{},
+		"gen_ai.output.messages":          present{},
+		"model":                           "gemini-2.5-flash",
+		"tokens.input":                    int64(1000),
+		"tokens.output":                   int64(200),
+		"tokens.total":                    int64(1200),
+		"gen_ai.usage.input_tokens":       int64(1000),
+		"gen_ai.usage.output_tokens":      int64(200),
+	}
+	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
+		t.Errorf("root attrs (-want +got):\n%s", diff)
+	}
+
+	turn := findSpan(spans, "chat gemini-2.5-flash")
+	if turn == nil {
+		t.Fatal("chat gemini-2.5-flash turn span not found")
+	}
+	wantTurn := map[string]any{
+		"gen_ai.operation.name":      "chat",
+		"gen_ai.request.model":       "gemini-2.5-flash",
+		"gen_ai.system":              "google.vertex",
+		"driftlessaf.turn.index":     int64(0),
+		"gen_ai.usage.input_tokens":  int64(1000),
+		"gen_ai.usage.output_tokens": int64(200),
+	}
+	if diff := cmp.Diff(wantTurn, attrsAsMap(turn), anyValue); diff != "" {
+		t.Errorf("turn attrs (-want +got):\n%s", diff)
+	}
+}
+
+// TestPayloadsDisabled verifies that with no WithPayloadsEnabled opt-in on
+// the ctx, the root span has no prompt/completion payload attributes but
+// still carries token usage, agent name, Braintrust name, and — on the
+// turn span — gen_ai.system and gen_ai.request.model. The absence of
+// the four payload keys falls out of the whole-map comparison (any extra
+// key in the got map would cause the diff to fail).
+func TestPayloadsDisabled(t *testing.T) {
+	sr := setupRecorder(t)
+
+	result := map[string]any{"summary": "ok"}
+	driveAgentTrace(t, t.Context(), "analyze these logs", "google.vertex", "gemini-2.5-flash", result,
+		WithAgentName("loganalyzer"),
+		WithNameFn(func(ec ExecutionContext) string { return "autofix: " + ec.ReconcilerKey }),
+	)
+
+	spans := sr.Ended()
+	root := findSpan(spans, "invoke_agent gemini-2.5-flash")
+	if root == nil {
+		t.Fatalf("root invoke_agent span not found; got %d spans", len(spans))
+	}
+
+	wantRoot := map[string]any{
+		"agent.prompt":                    "analyze these logs",
+		"gen_ai.operation.name":           "invoke_agent",
+		"gen_ai.agent.name":               "loganalyzer",
+		"braintrust.span_attributes.name": "autofix: pr:chainguard-dev/mono/38632",
+		"reconciler_key":                  "pr:chainguard-dev/mono/38632",
+		"reconciler_type":                 "pr",
+		"model":                           "gemini-2.5-flash",
+		"tokens.input":                    int64(1000),
+		"tokens.output":                   int64(200),
+		"tokens.total":                    int64(1200),
+		"gen_ai.usage.input_tokens":       int64(1000),
+		"gen_ai.usage.output_tokens":      int64(200),
+	}
+	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
+		t.Errorf("root attrs (-want +got):\n%s", diff)
+	}
+
+	turn := findSpan(spans, "chat gemini-2.5-flash")
+	if turn == nil {
+		t.Fatal("chat gemini-2.5-flash turn span not found")
+	}
+	wantTurn := map[string]any{
+		"gen_ai.operation.name":      "chat",
+		"gen_ai.request.model":       "gemini-2.5-flash",
+		"gen_ai.system":              "google.vertex",
+		"driftlessaf.turn.index":     int64(0),
+		"gen_ai.usage.input_tokens":  int64(1000),
+		"gen_ai.usage.output_tokens": int64(200),
+	}
+	if diff := cmp.Diff(wantTurn, attrsAsMap(turn), anyValue); diff != "" {
+		t.Errorf("turn attrs (-want +got):\n%s", diff)
+	}
+}
+
+// TestTruncation verifies that a prompt larger than maxPayloadBytes is
+// truncated before being emitted as gen_ai.prompt / gen_ai.input.messages,
+// and that braintrust.metadata.truncated=true is stamped to signal the
+// truncation to the backend.
+func TestTruncation(t *testing.T) {
+	sr := setupRecorder(t)
+
+	// Prompt comfortably larger than maxPayloadBytes. The JSON wrapper
+	// adds ~20 bytes around the raw string so the attribute string length
+	// will be bounded by maxPayloadBytes after truncation.
+	bigPrompt := strings.Repeat("x", 2*maxPayloadBytes)
+	driveAgentTrace(t, WithPayloadsEnabled(t.Context(), true), bigPrompt, "google.vertex", "gemini-2.5-flash", map[string]any{},
+		WithAgentName("loganalyzer"),
+	)
+
+	spans := sr.Ended()
+	root := findSpan(spans, "invoke_agent gemini-2.5-flash")
+	if root == nil {
+		t.Fatal("root invoke_agent span not found")
+	}
+
+	kv := findAttr(root, "gen_ai.input.messages")
+	if kv == nil {
+		t.Fatal("root: missing gen_ai.input.messages")
+	}
+	got := len(kv.Value.AsString())
+	if got > maxPayloadBytes {
+		t.Errorf("gen_ai.input.messages length = %d; want <= %d", got, maxPayloadBytes)
+	}
+
+	trunc := findAttr(root, "braintrust.metadata.truncated")
+	if trunc == nil || !trunc.Value.AsBool() {
+		t.Error("root: braintrust.metadata.truncated != true after truncation")
+	}
+}
+
+// TestNameFnNil verifies that when no nameFn is supplied the
+// braintrust.span_attributes.name attribute falls back to the agent name.
+func TestNameFnNil(t *testing.T) {
+	sr := setupRecorder(t)
+
+	driveAgentTrace(t, t.Context(), "hello", "google.vertex", "gemini-2.5-flash", map[string]any{},
+		WithAgentName("loganalyzer"),
+	)
+
+	spans := sr.Ended()
+	root := findSpan(spans, "invoke_agent gemini-2.5-flash")
+	if root == nil {
+		t.Fatal("root invoke_agent span not found")
+	}
+	kv := findAttr(root, "braintrust.span_attributes.name")
+	if kv == nil {
+		t.Fatal("root: missing braintrust.span_attributes.name")
+	}
+	if got, want := kv.Value.AsString(), "loganalyzer"; got != want {
+		t.Errorf("braintrust.span_attributes.name: got %q, want %q", got, want)
+	}
+}
+
+// TestDefaultAgentNameFromContext verifies that WithDefaultAgentName set
+// on the context feeds the agent name into StartTrace without the caller
+// passing WithAgentName explicitly. This covers the reconciler-layer
+// plumbing where the agent name is set once at the top of the chain.
+func TestDefaultAgentNameFromContext(t *testing.T) {
+	sr := setupRecorder(t)
+
+	ctx := t.Context()
+	ctx = WithExecutionContext(ctx, ExecutionContext{ReconcilerKey: "pr:foo/bar/1"})
+	ctx = WithDefaultAgentName(ctx, "judge")
+	ctx = WithDefaultNameFn(ctx, func(ec ExecutionContext) string { return "autofix: " + ec.ReconcilerKey })
+
+	trace, done := StartTrace[map[string]any](ctx, "prompt")
+	turn := trace.BeginTurn(0, "anthropic", "claude-haiku-4-5")
+	turn.End()
+	done(map[string]any{}, nil)
+
+	spans := sr.Ended()
+	root := findSpan(spans, "invoke_agent")
+	if root == nil {
+		t.Fatalf("root invoke_agent span not found; got %d spans", len(spans))
+	}
+	wantRoot := map[string]any{
+		"agent.prompt":                    "prompt",
+		"gen_ai.operation.name":           "invoke_agent",
+		"gen_ai.agent.name":               "judge",
+		"braintrust.span_attributes.name": "autofix: pr:foo/bar/1",
+		"reconciler_key":                  "pr:foo/bar/1",
+	}
+	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
+		t.Errorf("root attrs (-want +got):\n%s", diff)
+	}
+}

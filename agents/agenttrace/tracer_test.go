@@ -203,8 +203,8 @@ type countingDecorator[T any] struct {
 	onRecord func()
 }
 
-func (d *countingDecorator[T]) NewTrace(ctx context.Context, prompt string) *Trace[T] {
-	return d.inner.NewTrace(ctx, prompt)
+func (d *countingDecorator[T]) NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
+	return d.inner.NewTrace(ctx, prompt, opts...)
 }
 
 func (d *countingDecorator[T]) RecordTrace(trace *Trace[T]) {
@@ -218,8 +218,8 @@ type mockTracer[T any] struct {
 	onRecord func()
 }
 
-func (m *mockTracer[T]) NewTrace(ctx context.Context, prompt string) *Trace[T] {
-	return newTrace[T](ctx, prompt)
+func (m *mockTracer[T]) NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
+	return newTrace[T](ctx, prompt, opts...)
 }
 
 func (m *mockTracer[T]) RecordTrace(trace *Trace[T]) {

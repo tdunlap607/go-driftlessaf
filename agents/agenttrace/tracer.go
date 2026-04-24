@@ -14,8 +14,9 @@ type tracerKey[T any] struct{}
 
 // Tracer is the interface for creating and managing traces
 type Tracer[T any] interface {
-	// NewTrace creates a new trace with the given prompt
-	NewTrace(ctx context.Context, prompt string) *Trace[T]
+	// NewTrace creates a new trace with the given prompt. opts customize
+	// root-span attributes (agent name, Braintrust span name callback, etc.).
+	NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T]
 	// RecordTrace records a completed trace
 	RecordTrace(trace *Trace[T])
 }
@@ -38,9 +39,13 @@ func TracerFromContext[T any](ctx context.Context) Tracer[T] {
 // when the operation completes; this fills in the trace and records it via the
 // tracer. Capturing the tracer at start time means decorator composition works
 // without a second context lookup.
-func StartTrace[T any](ctx context.Context, prompt string) (*Trace[T], func(T, error)) {
+//
+// opts customize the root invoke_agent span attributes — e.g. WithAgentName
+// stamps gen_ai.agent.name, and WithNameFn produces a dynamic
+// braintrust.span_attributes.name label based on ExecutionContext.
+func StartTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOption) (*Trace[T], func(T, error)) {
 	tracer := TracerFromContext[T](ctx)
-	trace := tracer.NewTrace(ctx, prompt)
+	trace := tracer.NewTrace(ctx, prompt, opts...)
 	done := func(result T, err error) {
 		trace.complete(result, err)
 		tracer.RecordTrace(trace)

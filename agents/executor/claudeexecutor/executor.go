@@ -342,7 +342,7 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	executeTurn := func(turn int) (Response, bool, error) {
-		llmTurn := trace.BeginTurn(turn, e.modelName)
+		llmTurn := trace.BeginTurn(turn, agenttrace.SystemAnthropic, e.modelName)
 		defer llmTurn.End()
 
 		// Stream response with retry for transient errors

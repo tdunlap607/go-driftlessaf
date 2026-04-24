@@ -180,7 +180,7 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	executeTurn := func(turn int) (Response, bool, error) {
-		llmTurn := trace.BeginTurn(turn, e.modelName)
+		llmTurn := trace.BeginTurn(turn, agenttrace.SystemOpenAI, e.modelName)
 		defer llmTurn.End()
 
 		completion, err := retry.RetryWithBackoff(ctx, e.retryConfig, "chat_completion", isRetryableOpenAIError, func() (*openai.ChatCompletion, error) {

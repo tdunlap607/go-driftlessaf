@@ -335,7 +335,7 @@ func (e *executor[Request, Response]) Execute(
 	var responseText string
 	executeTurn := func(turn int, response *genai.GenerateContentResponse) (Response, *genai.GenerateContentResponse, bool, error) {
 		var zero Response
-		llmTurn := trace.BeginTurn(turn, e.model)
+		llmTurn := trace.BeginTurn(turn, agenttrace.SystemGoogleVertex, e.model)
 		defer llmTurn.End()
 
 		// Record tokens for the response being processed in this turn.

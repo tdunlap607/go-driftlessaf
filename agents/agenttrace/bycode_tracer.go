@@ -31,8 +31,8 @@ func ByCode[T any](callbacks ...TraceCallback[T]) Tracer[T] {
 // Callers should not use this directly — use StartTrace instead, which
 // captures the outermost tracer and returns a done callback that completes
 // and records the trace through the full decorator chain.
-func (t *byCodeTracer[T]) NewTrace(ctx context.Context, prompt string) *Trace[T] {
-	return newTrace[T](ctx, prompt)
+func (t *byCodeTracer[T]) NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
+	return newTrace[T](ctx, prompt, opts...)
 }
 
 // RecordTrace invokes all callbacks with the completed trace in parallel

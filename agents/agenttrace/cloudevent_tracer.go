@@ -58,8 +58,8 @@ func WithCloudEventEmission[T any](inner Tracer[T], client cloudevents.Client, s
 	return t
 }
 
-func (t *ceEmittingTracer[T]) NewTrace(ctx context.Context, prompt string) *Trace[T] {
-	return t.inner.NewTrace(ctx, prompt)
+func (t *ceEmittingTracer[T]) NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
+	return t.inner.NewTrace(ctx, prompt, opts...)
 }
 
 func (t *ceEmittingTracer[T]) RecordTrace(trace *Trace[T]) {
