@@ -47,6 +47,14 @@ type RetryConfig struct {
 	MaxBackoff time.Duration
 	// MaxJitter is the maximum random jitter added to backoff (default: 500ms)
 	MaxJitter time.Duration
+	// OnAttemptError, if non-nil, is called once per retryable attempt that
+	// triggers a sleep+retry. It is NOT called for non-retryable errors (those
+	// surface to the caller immediately) or for the final retryable error
+	// after retries are exhausted (that surfaces wrapped via the return value).
+	// Used by callers (e.g. agenttrace.LLMTurn.RecordError) to log transient
+	// errors that the retry recovered from — without it, those errors would
+	// be invisible whenever the retry eventually succeeded.
+	OnAttemptError func(err error)
 }
 
 // Validate checks that the retry configuration has valid values.
@@ -96,6 +104,13 @@ func RetryWithBackoff[T any](ctx context.Context, cfg RetryConfig, operation str
 
 		if attempt >= cfg.MaxRetries {
 			break
+		}
+
+		// At this point: lastErr is retryable AND we have retries remaining,
+		// so the caller would otherwise never see this error. Surface it via
+		// the callback before sleeping.
+		if cfg.OnAttemptError != nil {
+			cfg.OnAttemptError(lastErr)
 		}
 
 		// Calculate exponential backoff: BaseBackoff * 2^attempt, capped at MaxBackoff

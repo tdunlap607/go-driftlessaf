@@ -179,11 +179,26 @@ func (e *executor[Request, Response]) Execute(
 		return string(resBytes), nil
 	}
 
-	executeTurn := func(turn int) (Response, bool, error) {
+	// The named err return is load-bearing: the deferred Fail call below reads
+	// it at function exit. Every error path must use `return ..., err` (or set
+	// the named err before bare-returning) — a bare return inside a nested
+	// block where err is shadowed via `:=` would silently bypass Fail.
+	executeTurn := func(turn int) (_ Response, _ bool, err error) {
 		llmTurn := trace.BeginTurn(turn, agenttrace.SystemOpenAI, e.modelName)
-		defer llmTurn.End()
+		defer func() {
+			if err != nil {
+				llmTurn.Fail(err)
+			}
+			llmTurn.End()
+		}()
 
-		completion, err := retry.RetryWithBackoff(ctx, e.retryConfig, "chat_completion", isRetryableOpenAIError, func() (*openai.ChatCompletion, error) {
+		// Per-turn retry config wires transient API errors that the retry
+		// recovers from into the turn's Errors list. Without this, retries
+		// that eventually succeed leave no trace of the transients in BQ.
+		turnCfg := e.retryConfig
+		turnCfg.OnAttemptError = llmTurn.RecordError
+
+		completion, err := retry.RetryWithBackoff(ctx, turnCfg, "chat_completion", isRetryableOpenAIError, func() (*openai.ChatCompletion, error) {
 			return e.client.Chat.Completions.New(ctx, reqParams)
 		})
 		if err != nil {

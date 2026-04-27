@@ -39,7 +39,9 @@
       {"name": "output_tokens", "type": "INTEGER", "mode": "NULLABLE"},
       {"name": "start_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
       {"name": "end_time", "type": "TIMESTAMP", "mode": "NULLABLE"},
-      {"name": "error", "type": "STRING", "mode": "NULLABLE"}
+      {"name": "error", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "errors", "type": "STRING", "mode": "REPEATED"},
+      {"name": "failed", "type": "BOOLEAN", "mode": "NULLABLE"}
     ]
   },
   {

@@ -114,10 +114,18 @@ type RecordedTurn struct {
 	OutputTokens int64     `json:"output_tokens,omitempty"`
 	StartTime    time.Time `json:"start_time"`
 	EndTime      time.Time `json:"end_time"`
-	// Error is reserved for per-turn completion detail. Nothing populates it
-	// today — End() takes no error argument. A follow-up will wire turn-level
-	// error capture (e.g. retry-exhaustion, malformed response) into this field.
-	Error string `json:"error,omitempty"`
+	// Errors is the chronological list of errors the turn encountered, including
+	// transients that the turn recovered from. A non-empty list does NOT mean
+	// the turn failed — see Failed for the terminal outcome. Populated via
+	// LLMTurn.RecordError and LLMTurn.Fail.
+	Errors []string `json:"errors,omitempty"`
+	// Failed is the terminal outcome flag: true iff the turn ultimately failed.
+	// A turn can have non-empty Errors and Failed=false (it recovered from
+	// transient errors). Set by LLMTurn.Fail; defaults to false. Serialized
+	// without omitempty so successful turns get an explicit `false` in BQ
+	// instead of NULL — analytics queries can use `failed = FALSE` directly
+	// without the three-valued-logic gotcha of NULL.
+	Failed bool `json:"failed"`
 }
 
 // Trace represents a complete agent interaction from prompt to result.
@@ -341,6 +349,56 @@ func (lt *LLMTurn[T]) RecordTokens(inputTokens, outputTokens int64) {
 	lt.record.OutputTokens = outputTokens
 }
 
+// RecordError appends err to the turn's chronological error list and emits
+// an exception event on the OTEL span. It does NOT mark the turn as failed —
+// use Fail for that. RecordError is the right call for transient errors the
+// turn recovered from (e.g. a 503 that succeeded on retry); a non-empty
+// Errors list with Failed=false is exactly that recovery shape.
+//
+// A nil err is a no-op. Call before End.
+func (lt *LLMTurn[T]) RecordError(err error) {
+	if err == nil {
+		return
+	}
+	if lt.span != nil {
+		lt.span.RecordError(err)
+	}
+	lt.record.Errors = append(lt.record.Errors, err.Error())
+}
+
+// Fail marks the turn as having ultimately failed and sets the OTEL span
+// status to Error — mirroring ToolCall.Complete and Trace.complete on the
+// failure path. RecordedTurn.Failed flips to true unconditionally; if err is
+// non-nil it is also appended to Errors and recorded as a span exception
+// event.
+//
+// Fail(nil) is intentionally NOT symmetric with RecordError(nil). Calling
+// Fail means "this turn ended in failure" — that signal must propagate even
+// when the caller has no concrete error value (e.g. context cancellation
+// surfaced upstream as a sentinel). The alternative (silent no-op) trades a
+// loud false positive for a silent loss of failure signal in BQ; we prefer
+// the loud one because it's discoverable. Callers that don't want to fail
+// the turn must guard the call themselves: `if err != nil { lt.Fail(err) }`,
+// which is exactly what the executor wiring does.
+//
+// Call before End. Safe to call multiple times: the Failed flag is sticky
+// (subsequent calls don't toggle it off), and each call with non-nil err
+// appends to Errors.
+func (lt *LLMTurn[T]) Fail(err error) {
+	lt.record.Failed = true
+	if err != nil {
+		lt.record.Errors = append(lt.record.Errors, err.Error())
+	}
+	if lt.span != nil {
+		desc := ""
+		if err != nil {
+			lt.span.RecordError(err)
+			desc = err.Error()
+		}
+		lt.span.SetStatus(codes.Error, desc)
+	}
+}
+
 // End ends the turn span and restores the trace context to before the turn.
 // It is idempotent: subsequent calls are no-ops. On the first call, it
 // appends the accumulated RecordedTurn to the parent trace's Turns slice.
@@ -354,6 +412,14 @@ func (lt *LLMTurn[T]) End() {
 		lt.trace.ctx = lt.prevCtx
 		lt.trace.Turns = append(lt.trace.Turns, lt.record)
 		lt.trace.mu.Unlock()
+		// Decouple lt.record.Errors from the slice header just appended into
+		// trace.Turns. The contract says "Call before End", but a violation
+		// would otherwise produce capacity-dependent behavior — a post-End
+		// RecordError might mutate the parent's backing array (if cap > len)
+		// or be silently lost (if cap == len). After this nil-out, lt.record
+		// owns no shared array; any post-End append allocates fresh and
+		// writes into a private grave.
+		lt.record.Errors = nil
 	})
 }
 

@@ -211,6 +211,7 @@ func TestTraceMarshalJSON(t *testing.T) {
 					"system":        "google.vertex",
 					"input_tokens":  float64(100),
 					"output_tokens": float64(25),
+					"failed":        false,
 				},
 			},
 		},
@@ -221,16 +222,21 @@ func TestTraceMarshalJSON(t *testing.T) {
 			trace := tracer.NewTrace(t.Context(), "prompt")
 			t0 := trace.BeginTurn(0, "anthropic", "model-a")
 			t0.RecordTokens(100, 50)
+			t0.RecordError(errors.New("transient 429"))
 			t0.End()
 			t1 := trace.BeginTurn(1, "openai", "model-b")
 			t1.RecordTokens(200, 75)
+			t1.Fail(errors.New("retries exhausted: upstream 503"))
 			t1.End()
 			trace.complete("done", nil)
 			return trace
 		},
-		// Each turn lands as its own row in append order, with its own model
-		// and tokens. This is the property BQ rows of a multi-turn trace must
-		// have so per-turn analysis works.
+		// Two distinct shapes the events-list + terminal-status model expresses:
+		// - turn 0: recovered from a transient — errors logged, failed=false
+		// - turn 1: terminal failure — errors logged AND failed=true
+		// A clean success would have errors absent (omitempty) but failed=false
+		// explicitly: BQ analytics use `failed = FALSE` without three-valued
+		// logic across NULLs.
 		want: map[string]any{
 			"input_prompt": "prompt",
 			"result":       "done",
@@ -243,6 +249,8 @@ func TestTraceMarshalJSON(t *testing.T) {
 					"system":        "anthropic",
 					"input_tokens":  float64(100),
 					"output_tokens": float64(50),
+					"errors":        []any{"transient 429"},
+					"failed":        false,
 				},
 				map[string]any{
 					"index":         float64(1),
@@ -250,6 +258,8 @@ func TestTraceMarshalJSON(t *testing.T) {
 					"system":        "openai",
 					"input_tokens":  float64(200),
 					"output_tokens": float64(75),
+					"errors":        []any{"retries exhausted: upstream 503"},
+					"failed":        true,
 				},
 			},
 		},

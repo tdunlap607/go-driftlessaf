@@ -18,6 +18,7 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
@@ -368,6 +369,192 @@ func TestLLMTurnEndWithoutRecordTokens(t *testing.T) {
 	}
 	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
 		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// RecordError appends to the chronological Errors list without marking the
+// turn failed. This is the recovery shape: a transient error happened, the
+// turn went on to succeed, and BQ should see both facts (Errors non-empty,
+// Failed false).
+func TestLLMTurnRecordErrorAppendsWithoutFailing(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.RecordError(errors.New("transient 503"))
+	turn.End()
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic", Errors: []string{"transient 503"}},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// A nil err must be a no-op so callers can blindly route every err through
+// RecordError without nil-checking at every call site, and so the recovery
+// shape `RecordError(err); RecordError(nil)` doesn't leave a confusing empty
+// string in the Errors list.
+func TestLLMTurnRecordErrorNil(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.RecordError(nil)
+	turn.End()
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic"},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// All RecordError calls must be preserved in chronological order — that's the
+// whole point of moving to a list. BQ analytics like "count turns that saw a
+// 429 followed by a 503" depend on the order being faithful to what happened.
+func TestLLMTurnRecordErrorAppendsInOrder(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.RecordError(errors.New("first"))
+	turn.RecordError(errors.New("second"))
+	turn.End()
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic", Errors: []string{"first", "second"}},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// Fail marks the terminal outcome and also appends the cause to Errors so
+// the BQ row has both: a flag for "did this fail?" and the cause in the
+// chronological list. Otherwise queries would have to UNION two columns to
+// reconstruct what happened.
+func TestLLMTurnFail(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.Fail(errors.New("retries exhausted"))
+	turn.End()
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic", Errors: []string{"retries exhausted"}, Failed: true},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// Fail(nil) intentionally still marks the turn failed — calling Fail means
+// "this turn ended in failure," and that signal must reach BQ even when the
+// caller has no concrete error value to log. Errors stays empty because
+// there's nothing to append. This is the asymmetry with RecordError(nil),
+// which is a no-op: RecordError logs an event if there's one to log, while
+// Fail records terminal status whether or not a cause is supplied.
+//
+// The executor wiring guards `if err != nil { Fail(err) }` precisely because
+// of this — without the guard, successful turns (err=nil) would be marked
+// failed.
+func TestLLMTurnFailNilStillMarksFailed(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.Fail(nil)
+	turn.End()
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic", Failed: true},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// The recovery shape: a transient error was recorded, then the turn went on
+// to succeed. RecordError must NOT set Failed (that's Fail's job), so the
+// Errors list captures what the turn endured while Failed reflects the
+// terminal outcome. This is the case the prior single-string model could not
+// represent.
+func TestLLMTurnRecoveryAfterError(t *testing.T) {
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	turn := trace.BeginTurn(0, "anthropic", "model")
+	turn.RecordError(errors.New("transient 503"))
+	turn.End() // no Fail call: the turn recovered
+
+	want := []RecordedTurn{
+		{Index: 0, Model: "model", System: "anthropic", Errors: []string{"transient 503"}},
+	}
+	if diff := cmp.Diff(want, trace.Turns, ignoreTurnTimes); diff != "" {
+		t.Errorf("trace.Turns (-want +got):\n%s", diff)
+	}
+}
+
+// Fail must mark the turn span as Error so OTEL backends (Cloud Trace, Tempo,
+// Langfuse) light up the failure — parity with ToolCall.Complete and
+// Trace.complete which both set codes.Error on the wrapped span. RecordError,
+// in contrast, must NOT set status (it represents recoverable events) — only
+// the exception event lands on the span.
+func TestLLMTurnFailSetsSpanStatusRecordErrorDoesNot(t *testing.T) {
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(tp)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
+
+	tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
+	trace := tracer.NewTrace(t.Context(), randomString())
+
+	// Recovered turn: RecordError only — span status stays Unset.
+	rec := trace.BeginTurn(0, "test-system", "model-recovered")
+	rec.RecordError(errors.New("transient"))
+	rec.End()
+
+	// Failed turn: Fail sets Error status with the cause as description.
+	bad := trace.BeginTurn(1, "test-system", "model-failed")
+	bad.Fail(errors.New("boom"))
+	bad.End()
+
+	spans := map[string]sdktrace.ReadOnlySpan{}
+	for _, s := range sr.Ended() {
+		spans[s.Name()] = s
+	}
+
+	recSpan := spans["chat model-recovered"]
+	if recSpan == nil {
+		t.Fatal("chat model-recovered span not found")
+	}
+	if got, want := recSpan.Status().Code, codes.Unset; got != want {
+		t.Errorf("recovered turn span status: got = %v, want = %v (RecordError must not set status)", got, want)
+	}
+	var recHasException bool
+	for _, ev := range recSpan.Events() {
+		if ev.Name == "exception" {
+			recHasException = true
+		}
+	}
+	if !recHasException {
+		t.Error("recovered turn span: missing exception event from RecordError")
+	}
+
+	badSpan := spans["chat model-failed"]
+	if badSpan == nil {
+		t.Fatal("chat model-failed span not found")
+	}
+	if got, want := badSpan.Status().Code, codes.Error; got != want {
+		t.Errorf("failed turn span status: got = %v, want = %v", got, want)
+	}
+	if got, want := badSpan.Status().Description, "boom"; got != want {
+		t.Errorf("failed turn span description: got = %q, want = %q", got, want)
 	}
 }
 

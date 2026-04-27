@@ -333,10 +333,26 @@ func (e *executor[Request, Response]) Execute(
 
 	// Handle the conversation loop with bounded turns to prevent runaway executions.
 	var responseText string
-	executeTurn := func(turn int, response *genai.GenerateContentResponse) (Response, *genai.GenerateContentResponse, bool, error) {
+	// The named err return is load-bearing: the deferred Fail call below reads
+	// it at function exit. Every error path must use `return ..., err` (or set
+	// the named err before bare-returning) — a bare return inside a nested
+	// block where err is shadowed via `:=` would silently bypass Fail.
+	executeTurn := func(turn int, response *genai.GenerateContentResponse) (_ Response, _ *genai.GenerateContentResponse, _ bool, err error) {
 		var zero Response
 		llmTurn := trace.BeginTurn(turn, agenttrace.SystemGoogleVertex, e.model)
-		defer llmTurn.End()
+		defer func() {
+			if err != nil {
+				llmTurn.Fail(err)
+			}
+			llmTurn.End()
+		}()
+
+		// Per-turn retry config wires transient API errors that the retry
+		// recovers from into the turn's Errors list. Without this, retries
+		// that eventually succeed leave no trace of the transients in BQ.
+		// Used by all three in-turn retry call sites below.
+		turnCfg := e.retryConfig
+		turnCfg.OnAttemptError = llmTurn.RecordError
 
 		// Record tokens for the response being processed in this turn.
 		// Unlike claude/openai executors (which record tokens right after
@@ -372,7 +388,7 @@ func (e *executor[Request, Response]) Execute(
 
 			// Send a message asking the model to try again with retry for transient errors
 			retryMsg := genai.Part{Text: fmt.Sprintf("The function call was malformed. Please try again using the available functions: %v", funcNames)}
-			retryResp, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_malformed_retry", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
+			retryResp, err := retry.RetryWithBackoff(ctx, turnCfg, "send_malformed_retry", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
 				return chat.SendMessage(ctx, retryMsg)
 			})
 			if err != nil {
@@ -472,7 +488,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			// Send tool responses back to the chat with retry for transient errors
-			nextResponse, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_tool_responses", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
+			nextResponse, err := retry.RetryWithBackoff(ctx, turnCfg, "send_tool_responses", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
 				return chat.Send(ctx, toolResponseParts...)
 			})
 			if err != nil {
@@ -497,7 +513,7 @@ func (e *executor[Request, Response]) Execute(
 			clog.WarnContext(ctx, "Model responded with text instead of calling submit_result, redirecting")
 			e.recordToolCall(ctx, "submit_result_redirect")
 
-			redirectResp, err := retry.RetryWithBackoff(ctx, e.retryConfig, "send_submit_redirect", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
+			redirectResp, err := retry.RetryWithBackoff(ctx, turnCfg, "send_submit_redirect", isRetryableVertexError, func() (*genai.GenerateContentResponse, error) {
 				return chat.SendMessage(ctx, genai.Part{
 					Text: "You must call the submit_result tool to return your response. Do not respond with plain text. If you encountered an error or cannot complete the task, call submit_result with an appropriate error or summary.",
 				})

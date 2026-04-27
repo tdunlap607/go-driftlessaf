@@ -31,6 +31,85 @@ func alwaysRetryable(err error) bool {
 	return err != nil
 }
 
+// OnAttemptError must fire once for each retryable attempt that triggered a
+// retry — but NOT for the final attempt's err (success or terminal). This is
+// the contract that lets agenttrace.LLMTurn.RecordError record transient
+// errors without double-counting against LLMTurn.Fail (which records the
+// terminal cause separately).
+func TestRetryWithBackoff_OnAttemptError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("fires once per retryable attempt that triggers a retry", func(t *testing.T) {
+		t.Parallel()
+		retryableErr := errors.New("429")
+		var captured []string
+		cfg := testRetryConfig()
+		cfg.OnAttemptError = func(err error) { captured = append(captured, err.Error()) }
+
+		var attempts atomic.Int32
+		_, err := retry.RetryWithBackoff(t.Context(), cfg, "op", alwaysRetryable, func() (string, error) {
+			n := attempts.Add(1)
+			if n < 3 {
+				return "", retryableErr
+			}
+			return "ok", nil
+		})
+		if err != nil {
+			t.Fatalf("err: got %v, want nil", err)
+		}
+		// Two retryable attempts triggered retries; the third succeeded.
+		// OnAttemptError fires on the first two only — the third's "success"
+		// has no error to surface.
+		if got, want := len(captured), 2; got != want {
+			t.Fatalf("OnAttemptError calls: got %d, want %d", got, want)
+		}
+	})
+
+	t.Run("does not fire for non-retryable terminal error", func(t *testing.T) {
+		t.Parallel()
+		nonRetryable := errors.New("401")
+		var captured []string
+		cfg := testRetryConfig()
+		cfg.OnAttemptError = func(err error) { captured = append(captured, err.Error()) }
+
+		_, err := retry.RetryWithBackoff(t.Context(), cfg, "op", func(error) bool { return false }, func() (string, error) {
+			return "", nonRetryable
+		})
+		if err == nil {
+			t.Fatal("err: got nil, want non-nil")
+		}
+		// Non-retryable errors propagate to the caller's terminal handler
+		// (Fail), so OnAttemptError must stay silent to avoid double-recording.
+		if got := len(captured); got != 0 {
+			t.Fatalf("OnAttemptError calls: got %d, want 0", got)
+		}
+	})
+
+	t.Run("does not fire for the final retryable error after exhaustion", func(t *testing.T) {
+		t.Parallel()
+		retryableErr := errors.New("503")
+		var captured []string
+		cfg := testRetryConfig()
+		cfg.MaxRetries = 2
+		cfg.OnAttemptError = func(err error) { captured = append(captured, err.Error()) }
+
+		_, err := retry.RetryWithBackoff(t.Context(), cfg, "op", alwaysRetryable, func() (string, error) {
+			return "", retryableErr
+		})
+		if err == nil {
+			t.Fatal("err: got nil, want non-nil")
+		}
+		// MaxRetries=2 means 3 attempts total. Attempts 0 and 1 trigger
+		// retries (callback fires twice). Attempt 2 fails but exhausts —
+		// its err comes back wrapped via the return value, NOT via the
+		// callback. Caller's Fail records the wrapped err, completing
+		// the picture without duplication.
+		if got, want := len(captured), 2; got != want {
+			t.Fatalf("OnAttemptError calls: got %d, want %d", got, want)
+		}
+	})
+}
+
 func TestRetryWithBackoff_Success(t *testing.T) {
 	t.Parallel()
 	var attempts atomic.Int32

@@ -341,12 +341,27 @@ func (e *executor[Request, Response]) Execute(
 		})
 	}
 
-	executeTurn := func(turn int) (Response, bool, error) {
+	// The named err return is load-bearing: the deferred Fail call below reads
+	// it at function exit. Every error path must use `return ..., err` (or set
+	// the named err before bare-returning) — a bare return inside a nested
+	// block where err is shadowed via `:=` would silently bypass Fail.
+	executeTurn := func(turn int) (_ Response, _ bool, err error) {
 		llmTurn := trace.BeginTurn(turn, agenttrace.SystemAnthropic, e.modelName)
-		defer llmTurn.End()
+		defer func() {
+			if err != nil {
+				llmTurn.Fail(err)
+			}
+			llmTurn.End()
+		}()
+
+		// Per-turn retry config wires transient API errors that the retry
+		// recovers from into the turn's Errors list. Without this, retries
+		// that eventually succeed leave no trace of the transients in BQ.
+		turnCfg := e.retryConfig
+		turnCfg.OnAttemptError = llmTurn.RecordError
 
 		// Stream response with retry for transient errors
-		message, err := retry.RetryWithBackoff(ctx, e.retryConfig, "stream_message", isRetryableClaudeError, func() (anthropic.Message, error) {
+		message, err := retry.RetryWithBackoff(ctx, turnCfg, "stream_message", isRetryableClaudeError, func() (anthropic.Message, error) {
 			stream := e.client.Messages.NewStreaming(ctx, params)
 			var msg anthropic.Message
 			for stream.Next() {
