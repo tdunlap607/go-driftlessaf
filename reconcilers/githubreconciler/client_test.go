@@ -29,7 +29,7 @@ func (m *mockTokenSource) Token() (*oauth2.Token, error) {
 }
 
 func TestClientCache_Get(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	tests := []struct {
 		name       string

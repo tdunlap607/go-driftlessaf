@@ -6,7 +6,6 @@ SPDX-License-Identifier: Apache-2.0
 package submitresult
 
 import (
-	"context"
 	"testing"
 
 	"chainguard.dev/driftlessaf/agents/agenttrace"
@@ -23,7 +22,7 @@ func TestGoogleToolHandler(t *testing.T) {
 		t.Fatalf("unexpected tool name: %s", meta.Definition.Name)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	trace, _ := agenttrace.StartTrace[*sampleResult](ctx, "prompt")
 
 	call := &genai.FunctionCall{

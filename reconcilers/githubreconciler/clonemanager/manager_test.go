@@ -22,7 +22,7 @@ import (
 )
 
 func TestLeaseLifecycle(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	mgr, err := New(ctx, staticTokenSource(""), "clonemanager-test", nil)
 	if err != nil {

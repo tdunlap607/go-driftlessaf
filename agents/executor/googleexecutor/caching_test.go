@@ -31,7 +31,7 @@ import (
 // Run with -v to see the executor's "Prompt cache metrics" and
 // "Created context cache" log lines.
 func TestExecutorContextCaching(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	projectID := detectProjectID(ctx, t)
 	model := getTestModel()
 	t.Logf("Using model: %s", model)

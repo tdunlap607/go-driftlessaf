@@ -32,7 +32,7 @@ import (
 // Run with -v to see the executor's "Prompt cache metrics" log lines showing
 // cache_read_tokens and cache_creation_tokens per turn.
 func TestExecutorPromptCaching(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	projectID := detectProjectID(ctx, t)
 
 	const (

@@ -19,7 +19,7 @@ import (
 )
 
 func TestTokenSource_Token_Success(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	wantIdentity := fmt.Sprintf("identity-%d", rand.Int64())
 	wantOrg := fmt.Sprintf("org-%d", rand.Int64())
 	wantRepo := fmt.Sprintf("repo-%d", rand.Int64())

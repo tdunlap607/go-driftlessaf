@@ -61,7 +61,7 @@ func detectProjectID(ctx context.Context, t *testing.T) string {
 }
 
 func TestExecutorWithThinking(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Detect project ID
 	projectID := detectProjectID(ctx, t)
@@ -208,7 +208,7 @@ Please solve this problem and provide your answer in JSON format:
 // WithThinking to adaptive mode. A single Execute hitting the live API proves
 // the request is accepted end-to-end.
 func TestOpus47WithSamplingParamsAndThinking(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	projectID := detectProjectID(ctx, t)
 
 	// Opus 4.7 is served via the global Vertex endpoint.

@@ -55,7 +55,7 @@ func TestNewReconciler(t *testing.T) {
 	}
 
 	// Test that the function is actually the one we provided
-	ctx := context.Background()
+	ctx := t.Context()
 	testIssueResource := &Resource{Owner: "test", Repo: "test", Number: 1, Type: ResourceTypeIssue}
 	testPRResource := &Resource{Owner: "test", Repo: "test", Number: 2, Type: ResourceTypePullRequest}
 

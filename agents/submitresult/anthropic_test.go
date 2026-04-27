@@ -6,7 +6,6 @@ SPDX-License-Identifier: Apache-2.0
 package submitresult
 
 import (
-	"context"
 	"encoding/json"
 	"testing"
 
@@ -24,7 +23,7 @@ func TestClaudeToolHandler(t *testing.T) {
 		t.Fatalf("unexpected tool name: %s", meta.Definition.Name)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	trace, _ := agenttrace.StartTrace[*sampleResult](ctx, "prompt")
 
 	input := map[string]any{

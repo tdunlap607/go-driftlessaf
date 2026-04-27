@@ -8,12 +8,11 @@ SPDX-License-Identifier: Apache-2.0
 package judge
 
 import (
-	"context"
 	"testing"
 )
 
 func TestNewVertex(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	projectID := "test-project"
 	region := "us-central1"
 
