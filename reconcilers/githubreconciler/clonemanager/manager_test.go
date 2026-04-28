@@ -95,6 +95,21 @@ func TestLeaseLifecycle(t *testing.T) {
 		t.Fatalf("returning missing lease: %v", err)
 	}
 
+	// A path whose intermediate directory does not exist must also be
+	// treated as a non-existent path, not surfaced as an error.
+	missingDir := *res
+	missingDir.Path = "nonexistent/missing.yaml"
+	leaseMissingDir, err := mgr.Lease(ctx, &missingDir)
+	if err != nil {
+		t.Fatalf("Lease missing directory path: %v", err)
+	}
+	if leaseMissingDir.PathExists() {
+		t.Fatalf("expected missing directory path to report false")
+	}
+	if err := leaseMissingDir.Return(ctx); err != nil {
+		t.Fatalf("returning missing directory lease: %v", err)
+	}
+
 	// Commit a new file directly into the worktree, advancing HEAD beyond
 	// the remote. This simulates a rogue commit must be undone.
 	cloneRepo, err := git.PlainOpen(lease2.WorkingTree())

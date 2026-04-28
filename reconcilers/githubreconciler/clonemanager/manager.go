@@ -321,10 +321,12 @@ func (m *Manager) prepareClone(ctx context.Context, cl *clone, ref string, res *
 			return remoteRef.Hash().String(), false, fmt.Errorf("getting tree: %w", err)
 		}
 
-		// Verify the path exists in the git tree.
+		// Verify the path exists in the git tree. FindEntry returns
+		// ErrEntryNotFound when the final path component is missing, and
+		// ErrDirectoryNotFound when an intermediate directory is missing.
 		_, err = tree.FindEntry(res.Path)
 		if err != nil {
-			if errors.Is(err, object.ErrEntryNotFound) {
+			if errors.Is(err, object.ErrEntryNotFound) || errors.Is(err, object.ErrDirectoryNotFound) {
 				clog.DebugContextf(ctx, "Path %s not found at commit %s", res.Path, remoteRef.Hash().String())
 				return remoteRef.Hash().String(), false, nil
 			}
