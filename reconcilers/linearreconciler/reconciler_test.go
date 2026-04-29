@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -284,5 +285,262 @@ func TestReconcile_MultipleRequiredLabels_AnyMatch(t *testing.T) {
 	}
 	if got := callCount.Load(); got != 2 {
 		t.Errorf("after gamma: reconcileFunc call count = %d, want 2 (gamma should be skipped)", got)
+	}
+}
+
+// makeIssueLabels builds an Issue with the given labels attached. Used by the
+// AND/NOT/predicate tests below where we need more than one label per issue.
+func makeIssueLabels(id, identifier string, labels ...string) *Issue {
+	issue := &Issue{
+		ID:         id,
+		Identifier: identifier,
+		Title:      "Issue " + identifier,
+	}
+	for _, l := range labels {
+		issue.Labels.Nodes = append(issue.Labels.Nodes, struct {
+			Name string `json:"name"`
+		}{Name: l})
+	}
+	issue.Team.Key = "ENG"
+	return issue
+}
+
+func TestReconcile_AllRequiredLabels_AND(t *testing.T) {
+	bothIssue := makeIssueLabels("issue-both", "TEST-BOTH", "alpha", "beta")
+	alphaIssue := makeIssueLabels("issue-alpha", "TEST-A", "alpha")
+	emptyIssue := makeIssueLabels("issue-empty", "TEST-E")
+
+	srv := newTestServerMulti(t, map[string]*Issue{
+		"issue-both":  bothIssue,
+		"issue-alpha": alphaIssue,
+		"issue-empty": emptyIssue,
+	})
+	defer srv.Close()
+
+	client := NewClientWithAPIKey("test-key").
+		WithHTTPClient(srv.Client()).
+		WithEndpoint(srv.URL)
+
+	var callCount atomic.Int32
+	r := &Reconciler{
+		client: client,
+		reconcileFunc: func(_ context.Context, _ *Issue, _ *Client) error {
+			callCount.Add(1)
+			return nil
+		},
+	}
+	WithAllRequiredLabels("alpha", "beta")(r)
+	r.client.BotUserID = "bot-1"
+
+	ctx := t.Context()
+
+	if err := r.Reconcile(ctx, "issue-both"); err != nil {
+		t.Fatalf("Reconcile(both) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after both: call count = %d, want 1", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-alpha"); err != nil {
+		t.Fatalf("Reconcile(alpha) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after alpha (missing beta): call count = %d, want 1 (skipped)", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-empty"); err != nil {
+		t.Fatalf("Reconcile(empty) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after empty: call count = %d, want 1 (skipped)", got)
+	}
+}
+
+func TestReconcile_WithoutLabel_NOT(t *testing.T) {
+	plainIssue := makeIssueLabels("issue-plain", "TEST-P", "alpha")
+	skippedIssue := makeIssueLabels("issue-skip", "TEST-S", "alpha", "skip:linear-materializer")
+
+	srv := newTestServerMulti(t, map[string]*Issue{
+		"issue-plain": plainIssue,
+		"issue-skip":  skippedIssue,
+	})
+	defer srv.Close()
+
+	client := NewClientWithAPIKey("test-key").
+		WithHTTPClient(srv.Client()).
+		WithEndpoint(srv.URL)
+
+	var callCount atomic.Int32
+	r := &Reconciler{
+		client: client,
+		reconcileFunc: func(_ context.Context, _ *Issue, _ *Client) error {
+			callCount.Add(1)
+			return nil
+		},
+	}
+	WithoutLabel("skip:linear-materializer")(r)
+	r.client.BotUserID = "bot-1"
+
+	ctx := t.Context()
+
+	if err := r.Reconcile(ctx, "issue-plain"); err != nil {
+		t.Fatalf("Reconcile(plain) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after plain: call count = %d, want 1", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-skip"); err != nil {
+		t.Fatalf("Reconcile(skip) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after skip: call count = %d, want 1 (issue with skip label must be filtered)", got)
+	}
+}
+
+func TestReconcile_LabelPredicate_Custom(t *testing.T) {
+	managedIssue := makeIssueLabels("issue-managed", "TEST-M", "team:platform", "materializer:managed")
+	otherIssue := makeIssueLabels("issue-other", "TEST-O", "team:other", "materializer:managed")
+
+	srv := newTestServerMulti(t, map[string]*Issue{
+		"issue-managed": managedIssue,
+		"issue-other":   otherIssue,
+	})
+	defer srv.Close()
+
+	client := NewClientWithAPIKey("test-key").
+		WithHTTPClient(srv.Client()).
+		WithEndpoint(srv.URL)
+
+	var callCount atomic.Int32
+	r := &Reconciler{
+		client: client,
+		reconcileFunc: func(_ context.Context, _ *Issue, _ *Client) error {
+			callCount.Add(1)
+			return nil
+		},
+	}
+	// Custom predicate: must carry team:platform.
+	WithLabelPredicate(func(labels []string) bool {
+		return slices.Contains(labels, "team:platform")
+	})(r)
+	r.client.BotUserID = "bot-1"
+
+	ctx := t.Context()
+
+	if err := r.Reconcile(ctx, "issue-managed"); err != nil {
+		t.Fatalf("Reconcile(managed) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after managed: call count = %d, want 1", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-other"); err != nil {
+		t.Fatalf("Reconcile(other) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after other: call count = %d, want 1 (predicate must reject)", got)
+	}
+}
+
+// TestReconcile_LabelOptions_CaseInsensitive pins down the documented
+// case-insensitive contract on WithAllRequiredLabels and WithoutLabel: a label
+// stored as "Materializer:Managed" must still match the lowercase option.
+func TestReconcile_LabelOptions_CaseInsensitive(t *testing.T) {
+	mixedCaseIssue := makeIssueLabels("issue-mixed", "TEST-MIXED", "Materializer:Managed", "Skip:Linear-Materializer")
+	plainIssue := makeIssueLabels("issue-plain", "TEST-PLAIN", "Materializer:Managed")
+
+	srv := newTestServerMulti(t, map[string]*Issue{
+		"issue-mixed": mixedCaseIssue,
+		"issue-plain": plainIssue,
+	})
+	defer srv.Close()
+
+	client := NewClientWithAPIKey("test-key").
+		WithHTTPClient(srv.Client()).
+		WithEndpoint(srv.URL)
+
+	var callCount atomic.Int32
+	r := &Reconciler{
+		client: client,
+		reconcileFunc: func(_ context.Context, _ *Issue, _ *Client) error {
+			callCount.Add(1)
+			return nil
+		},
+	}
+	WithAllRequiredLabels("materializer:managed")(r)
+	WithoutLabel("skip:linear-materializer")(r)
+	r.client.BotUserID = "bot-1"
+
+	ctx := t.Context()
+
+	// plain has the lowercase-required label in mixed case; should be accepted.
+	if err := r.Reconcile(ctx, "issue-plain"); err != nil {
+		t.Fatalf("Reconcile(plain) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after plain: call count = %d, want 1 (case-insensitive match)", got)
+	}
+
+	// mixed also carries the skip label in mixed case; should be filtered.
+	if err := r.Reconcile(ctx, "issue-mixed"); err != nil {
+		t.Fatalf("Reconcile(mixed) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after mixed: call count = %d, want 1 (skip label must match case-insensitively)", got)
+	}
+}
+
+// TestReconcile_RequiredAndWithoutLabel_Mixed exercises the materializer's
+// real-world composition: WithRequiredLabel + WithoutLabel must AND together.
+func TestReconcile_RequiredAndWithoutLabel_Mixed(t *testing.T) {
+	managedIssue := makeIssueLabels("issue-managed", "TEST-M", "materializer:managed")
+	skippedIssue := makeIssueLabels("issue-skip", "TEST-S", "materializer:managed", "skip:linear-materializer")
+	unmanagedIssue := makeIssueLabels("issue-unmanaged", "TEST-U", "other:label")
+
+	srv := newTestServerMulti(t, map[string]*Issue{
+		"issue-managed":   managedIssue,
+		"issue-skip":      skippedIssue,
+		"issue-unmanaged": unmanagedIssue,
+	})
+	defer srv.Close()
+
+	client := NewClientWithAPIKey("test-key").
+		WithHTTPClient(srv.Client()).
+		WithEndpoint(srv.URL)
+
+	var callCount atomic.Int32
+	r := &Reconciler{
+		client:         client,
+		requiredLabels: []string{"materializer:managed"},
+		reconcileFunc: func(_ context.Context, _ *Issue, _ *Client) error {
+			callCount.Add(1)
+			return nil
+		},
+	}
+	WithoutLabel("skip:linear-materializer")(r)
+	r.client.BotUserID = "bot-1"
+
+	ctx := t.Context()
+
+	if err := r.Reconcile(ctx, "issue-managed"); err != nil {
+		t.Fatalf("Reconcile(managed) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after managed: call count = %d, want 1", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-skip"); err != nil {
+		t.Fatalf("Reconcile(skip) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after skip: call count = %d, want 1 (skip label must take precedence)", got)
+	}
+
+	if err := r.Reconcile(ctx, "issue-unmanaged"); err != nil {
+		t.Fatalf("Reconcile(unmanaged) unexpected error: %v", err)
+	}
+	if got := callCount.Load(); got != 1 {
+		t.Errorf("after unmanaged: call count = %d, want 1 (missing required label)", got)
 	}
 }

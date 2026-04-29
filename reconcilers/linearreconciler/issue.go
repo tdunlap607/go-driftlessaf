@@ -77,6 +77,17 @@ func (i *Issue) HasLabel(name string) bool {
 	return false
 }
 
+// LabelNames returns the names of labels attached to this issue, in the order
+// Linear returned them. Names are returned verbatim (no case folding) — use
+// HasLabel for case-insensitive comparisons.
+func (i *Issue) LabelNames() []string {
+	names := make([]string, 0, len(i.Labels.Nodes))
+	for _, l := range i.Labels.Nodes {
+		names = append(names, l.Name)
+	}
+	return names
+}
+
 // FindAttachment returns the first attachment matching the given title, or nil.
 func (i *Issue) FindAttachment(title string) *Attachment {
 	for idx := range i.Attachments.Nodes {

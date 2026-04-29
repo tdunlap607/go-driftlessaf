@@ -30,7 +30,10 @@ type Reconciler struct {
 	client        *Client
 
 	requiredLabels []string
-	teamFilter     string
+	// labelPredicates are evaluated after requiredLabels. Each receives the
+	// issue and a slice of its label names (precomputed once per Reconcile).
+	labelPredicates []func(*Issue, []string) bool
+	teamFilter      string
 }
 
 // Option configures a Reconciler.
@@ -43,15 +46,69 @@ func WithReconciler(f ReconcilerFunc) Option {
 	}
 }
 
-// WithRequiredLabel configures a label gate: issues without any of the
-// specified labels are skipped (returns success without calling
-// ReconcilerFunc). Multiple labels are combined with OR semantics — an
-// issue is accepted if it has at least one of the given labels.
+// WithRequiredLabel configures an OR-semantics label gate: issues without
+// any of the specified labels are skipped. Repeated calls and variadic args
+// accumulate into the same OR set — an issue is accepted if it has at least
+// one of the listed labels.
 //
-// Backward-compatible: callers passing a single label still work.
+// For AND or NOT semantics, use WithAllRequiredLabels, WithoutLabel, or
+// WithLabelPredicate. Multiple gates compose: the OR set must match AND every
+// predicate must return true.
 func WithRequiredLabel(labels ...string) Option {
 	return func(r *Reconciler) {
 		r.requiredLabels = append(r.requiredLabels, labels...)
+	}
+}
+
+// WithAllRequiredLabels configures an AND-semantics label gate: the issue must
+// carry every listed label (case-insensitive, matching Issue.HasLabel) or it
+// is skipped. Multiple WithAllRequiredLabels options compose by AND.
+//
+// Calling with zero labels is a no-op (returns no predicate) so a forgotten
+// argument list doesn't accidentally evaluate to a vacuous-true gate.
+func WithAllRequiredLabels(labels ...string) Option {
+	if len(labels) == 0 {
+		return func(*Reconciler) {}
+	}
+	required := slices.Clone(labels)
+	return func(r *Reconciler) {
+		r.labelPredicates = append(r.labelPredicates, func(i *Issue, _ []string) bool {
+			for _, l := range required {
+				if !i.HasLabel(l) {
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
+
+// WithoutLabel skips issues carrying the given label (case-insensitive,
+// matching Issue.HasLabel). Useful for opt-out labels like
+// "skip:linear-materializer". Multiple WithoutLabel options compose by AND.
+func WithoutLabel(label string) Option {
+	return func(r *Reconciler) {
+		r.labelPredicates = append(r.labelPredicates, func(i *Issue, _ []string) bool {
+			return !i.HasLabel(label)
+		})
+	}
+}
+
+// WithLabelPredicate adds an arbitrary predicate over the issue's label names.
+// The predicate receives label names verbatim (no case folding). Returning
+// false skips the issue. Multiple predicates compose by AND with each other
+// and with WithAllRequiredLabels / WithoutLabel.
+//
+// The label slice is computed once per Reconcile and shared across all
+// predicates, so registering many WithLabelPredicate options is cheap.
+//
+// Prefer WithAllRequiredLabels and WithoutLabel for the common cases since
+// they share Issue.HasLabel's case-insensitive comparison.
+func WithLabelPredicate(fn func(labels []string) bool) Option {
+	return func(r *Reconciler) {
+		r.labelPredicates = append(r.labelPredicates, func(_ *Issue, labels []string) bool {
+			return fn(labels)
+		})
 	}
 }
 
@@ -115,6 +172,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, key string) error {
 	if len(r.requiredLabels) > 0 && !slices.ContainsFunc(r.requiredLabels, issue.HasLabel) {
 		log.With("required_labels", r.requiredLabels).Infof("Issue missing all required labels, skipping")
 		return nil
+	}
+
+	if len(r.labelPredicates) > 0 {
+		labels := issue.LabelNames()
+		for _, pred := range r.labelPredicates {
+			if !pred(issue, labels) {
+				log.With("labels", labels).Infof("Issue rejected by label predicate, skipping")
+				return nil
+			}
+		}
 	}
 
 	if r.teamFilter != "" && issue.Team.Key != r.teamFilter {
