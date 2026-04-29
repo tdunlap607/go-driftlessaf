@@ -103,6 +103,11 @@ func (r *MatchingEngineRetriever) Search(ctx context.Context, query []float32, o
 			Datapoint: &aiplatformpb.IndexDatapoint{
 				DatapointId:   "query",
 				FeatureVector: query,
+				// Restricts on the query datapoint instruct Vertex to filter
+				// neighbours: a stored datapoint matches only when its own
+				// restrict for each queried namespace contains at least one
+				// of the allow values listed here.
+				Restricts: restrictsToProto(opts.Restricts),
 			},
 			NeighborCount: int32(neighborCount),
 		}},

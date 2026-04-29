@@ -21,21 +21,23 @@ type memoryStore struct {
 }
 
 type memoryRecord struct {
-	vector   []float32
-	metadata map[string]string
+	vector    []float32
+	metadata  map[string]string
+	restricts map[string][]string
 }
 
 func newMemoryStore() *memoryStore {
 	return &memoryStore{records: make(map[string]memoryRecord)}
 }
 
-func (s *memoryStore) Upsert(_ context.Context, id string, vector []float32, metadata map[string]string) error {
+func (s *memoryStore) Upsert(_ context.Context, id string, vector []float32, metadata map[string]string, opts ...UpsertOption) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err != nil {
 		return s.err
 	}
-	s.records[id] = memoryRecord{vector: vector, metadata: metadata}
+	cfg := resolveUpsertOptions(opts)
+	s.records[id] = memoryRecord{vector: vector, metadata: metadata, restricts: cfg.restricts}
 	return nil
 }
 
@@ -74,6 +76,32 @@ func TestMultiStoreUpsertWritesToAllStores(t *testing.T) {
 		}
 		if r.metadata["key"] != "value" {
 			t.Errorf("store %d: metadata[key]: got = %q, want = %q", i, r.metadata["key"], "value")
+		}
+	}
+}
+
+func TestMultiStoreUpsertForwardsRestrictsToEveryBackend(t *testing.T) {
+	// Restricts must reach every backing store — Matching Engine uses them
+	// for query filtering, GCS persists them so a re-index can re-attach
+	// them. A backend that drops them silently would create a corpus where
+	// the canonical-source-of-truth (GCS) and the live index disagree.
+	s1 := newMemoryStore()
+	s2 := newMemoryStore()
+	ms := NewMultiStore(s1, s2)
+
+	want := map[string][]string{"domain": {"package-build"}}
+	if err := ms.Upsert(t.Context(), "id", []float32{0.1}, map[string]string{}, WithRestricts(want)); err != nil {
+		t.Fatalf("Upsert: %v", err)
+	}
+
+	for i, s := range []*memoryStore{s1, s2} {
+		r, ok := s.get("id")
+		if !ok {
+			t.Errorf("store %d: record not found", i)
+			continue
+		}
+		if got := r.restricts["domain"]; len(got) != 1 || got[0] != "package-build" {
+			t.Errorf("store %d: restricts not forwarded: got %v, want %v", i, r.restricts, want)
 		}
 	}
 }

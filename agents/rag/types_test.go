@@ -66,3 +66,69 @@ func TestSearchOptionsDefaultsDoesNotMutateOriginal(t *testing.T) {
 		t.Errorf("original.DistanceThreshold mutated: got = %f, want = 0", original.DistanceThreshold)
 	}
 }
+
+func TestWithRestrictsAppliesToConfig(t *testing.T) {
+	r := map[string][]string{"domain": {"package-build"}, "lang": {"go"}}
+	cfg := resolveUpsertOptions([]UpsertOption{WithRestricts(r)})
+
+	if cfg.restricts == nil {
+		t.Fatal("expected restricts to be set, got nil")
+	}
+	if got, want := len(cfg.restricts), 2; got != want {
+		t.Errorf("namespace count: got = %d, want = %d", got, want)
+	}
+	if got, want := cfg.restricts["domain"], []string{"package-build"}; got[0] != want[0] {
+		t.Errorf("domain allow list: got = %v, want = %v", got, want)
+	}
+}
+
+func TestResolveUpsertOptionsLastWriteWins(t *testing.T) {
+	// When the same option is supplied twice, the later one overrides —
+	// keeps the API predictable and avoids merging surprises.
+	first := map[string][]string{"domain": {"package-build"}}
+	second := map[string][]string{"domain": {"mono"}}
+
+	cfg := resolveUpsertOptions([]UpsertOption{
+		WithRestricts(first),
+		WithRestricts(second),
+	})
+
+	if got, want := cfg.restricts["domain"][0], "mono"; got != want {
+		t.Errorf("expected last WithRestricts to win: got = %q, want = %q", got, want)
+	}
+}
+
+func TestResolveUpsertOptionsZeroOptions(t *testing.T) {
+	cfg := resolveUpsertOptions(nil)
+	if cfg.restricts != nil {
+		t.Errorf("expected nil restricts when no options, got %v", cfg.restricts)
+	}
+}
+
+func TestRestrictsToProtoEmptyReturnsNil(t *testing.T) {
+	// Sending an empty Restrictions slice to the API would behave the same
+	// as nil but waste a bit of wire — confirm we omit the field entirely.
+	if got := restrictsToProto(nil); got != nil {
+		t.Errorf("nil input: got %v, want nil", got)
+	}
+	if got := restrictsToProto(map[string][]string{}); got != nil {
+		t.Errorf("empty map input: got %v, want nil", got)
+	}
+}
+
+func TestRestrictsToProtoStableOrdering(t *testing.T) {
+	// Stable wire ordering makes payloads diff-friendly in logs and
+	// catches regressions in any equality testing the caller does.
+	in := map[string][]string{"zeta": {"z"}, "alpha": {"a"}, "mu": {"m"}}
+	got := restrictsToProto(in)
+
+	if len(got) != 3 {
+		t.Fatalf("namespace count: got %d, want 3", len(got))
+	}
+	want := []string{"alpha", "mu", "zeta"}
+	for i, ns := range want {
+		if got[i].GetNamespace() != ns {
+			t.Errorf("namespace[%d]: got %q, want %q", i, got[i].GetNamespace(), ns)
+		}
+	}
+}

@@ -92,6 +92,29 @@ type SearchOptions struct {
 	//   SearchOptions{TopK: 10, DistanceThreshold: 0.3} // strict: only very similar
 	//   SearchOptions{TopK: 10, DistanceThreshold: 0.6} // moderate: related content
 	DistanceThreshold float64
+
+	// Restricts narrows results to datapoints whose stored restricts overlap
+	// the supplied allow lists. The map is keyed by namespace; each value
+	// is the set of allowed values for that namespace. Restricts are
+	// AND-ed across namespaces (a result must match every namespace) and
+	// OR-ed within a namespace (any value matches).
+	//
+	// Datapoints carry restricts via WithRestricts at write time. A
+	// datapoint with no value for a queried namespace is excluded — there
+	// is no implicit "untagged" group.
+	//
+	// Use restricts to partition a single index into logical sub-corpora
+	// (e.g., by tenant, language, or domain) without standing up a
+	// separate index per partition. Leave nil/empty to search across the
+	// whole corpus.
+	//
+	// Example — return only fixes from the "package-build" domain:
+	//
+	//   SearchOptions{
+	//     TopK: 5,
+	//     Restricts: map[string][]string{"domain": {"package-build"}},
+	//   }
+	Restricts map[string][]string
 }
 
 // Result represents a single vector search result.
@@ -114,4 +137,44 @@ func (o SearchOptions) defaults() SearchOptions {
 		o.TopK = DefaultTopK
 	}
 	return o
+}
+
+// UpsertOption configures a write to a Store. Options are applied in order;
+// later options override earlier ones for the same field.
+type UpsertOption func(*upsertConfig)
+
+// upsertConfig is the resolved set of options for a single Upsert call.
+// Stays unexported so the only way to construct it is via With* helpers,
+// which keeps the API surface controlled as new options are added.
+type upsertConfig struct {
+	// restricts are stored alongside the datapoint and used by the index
+	// to filter at query time. See SearchOptions.Restricts for semantics.
+	restricts map[string][]string
+}
+
+// resolveUpsertOptions applies a slice of options to a fresh upsertConfig.
+// Stores call this once per Upsert.
+func resolveUpsertOptions(opts []UpsertOption) upsertConfig {
+	var cfg upsertConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// WithRestricts attaches restrict tags to a datapoint at write time. The
+// datapoint becomes selectable via SearchOptions.Restricts using matching
+// namespace/value pairs.
+//
+// The restricts map is keyed by namespace; each value is the set of allow
+// values stored for that namespace on this datapoint. A query whose
+// SearchOptions.Restricts intersects on every queried namespace will match
+// this datapoint.
+//
+// Pass nil or an empty map to write a datapoint with no restricts (the
+// pre-existing default — searchable only by queries that don't restrict).
+func WithRestricts(restricts map[string][]string) UpsertOption {
+	return func(c *upsertConfig) {
+		c.restricts = restricts
+	}
 }

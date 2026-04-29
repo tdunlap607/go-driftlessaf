@@ -112,16 +112,19 @@ func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
 // The source text is automatically included in metadata under MetadataKeySourceText
 // so that embeddings can be regenerated when upgrading models.
 //
+// Pass UpsertOption values (e.g. WithRestricts) to attach index-level restrict
+// tags that callers can later filter on via SearchOptions.Restricts.
+//
 // The caller's metadata map is not modified; a copy is made before adding the source text.
-func (c *Client) EmbedAndStore(ctx context.Context, id, text string, taskType TaskType, metadata map[string]string) error {
-	return c.embedAndStore(ctx, id, text, taskType, metadata, c.embedder.Embed)
+func (c *Client) EmbedAndStore(ctx context.Context, id, text string, taskType TaskType, metadata map[string]string, opts ...UpsertOption) error {
+	return c.embedAndStore(ctx, id, text, taskType, metadata, c.embedder.Embed, opts...)
 }
 
 // embedFn is the signature for generating an embedding vector from text.
 type embedFn func(ctx context.Context, text string, taskType TaskType) ([]float32, error)
 
 // embedAndStore is the core implementation, accepting an embed function for testability.
-func (c *Client) embedAndStore(ctx context.Context, id, text string, taskType TaskType, metadata map[string]string, embed embedFn) error {
+func (c *Client) embedAndStore(ctx context.Context, id, text string, taskType TaskType, metadata map[string]string, embed embedFn, opts ...UpsertOption) error {
 	vector, err := embed(ctx, text, taskType)
 	if err != nil {
 		return fmt.Errorf("embedding text: %w", err)
@@ -135,7 +138,7 @@ func (c *Client) embedAndStore(ctx context.Context, id, text string, taskType Ta
 		md[MetadataKeySourceText] = text
 	}
 
-	if err := c.store.Upsert(ctx, id, vector, md); err != nil {
+	if err := c.store.Upsert(ctx, id, vector, md, opts...); err != nil {
 		return fmt.Errorf("storing embedding: %w", err)
 	}
 

@@ -25,12 +25,15 @@ var (
 // gcsRecord is the JSON structure persisted in GCS for each datapoint.
 // It stores the source text, metadata, and embedding vector so the index
 // can be rebuilt from scratch (e.g., when upgrading embedding models).
+// Restricts are persisted alongside metadata so that re-indexing scripts
+// can re-attach them when re-upserting into Matching Engine.
 type gcsRecord struct {
-	ID         string            `json:"id"`
-	SourceText string            `json:"source_text"`
-	Metadata   map[string]string `json:"metadata"`
-	Vector     []float32         `json:"vector"`
-	StoredAt   string            `json:"stored_at"`
+	ID         string              `json:"id"`
+	SourceText string              `json:"source_text"`
+	Metadata   map[string]string   `json:"metadata"`
+	Restricts  map[string][]string `json:"restricts,omitempty"`
+	Vector     []float32           `json:"vector"`
+	StoredAt   string              `json:"stored_at"`
 }
 
 // GCSStore implements Store by persisting embedding records to Google Cloud Storage.
@@ -69,15 +72,21 @@ func NewGCSStore(ctx context.Context, bucket, prefix string, opts ...option.Clie
 // should be passed in metadata under MetadataKeySourceText so it can be
 // re-embedded when upgrading models. If not present, the vector is still stored
 // but re-embedding will require the original source data from elsewhere.
-func (s *GCSStore) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string) error {
+//
+// Restricts attached via WithRestricts are persisted in the JSON record so
+// re-index scripts can re-attach them when re-upserting into Matching Engine.
+func (s *GCSStore) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string, opts ...UpsertOption) error {
 	if id == "" {
 		return fmt.Errorf("id is required")
 	}
+
+	cfg := resolveUpsertOptions(opts)
 
 	record := gcsRecord{
 		ID:         id,
 		SourceText: metadata[MetadataKeySourceText],
 		Metadata:   metadata,
+		Restricts:  cfg.restricts,
 		Vector:     vector,
 		StoredAt:   time.Now().UTC().Format(time.RFC3339),
 	}
@@ -127,10 +136,13 @@ func NewMultiStore(stores ...Store) *MultiStore {
 
 // Upsert writes to all stores. All stores are attempted regardless of
 // individual failures; errors are collected and returned via errors.Join.
-func (m *MultiStore) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string) error {
+// Options (e.g. WithRestricts) are forwarded to every backing store, so
+// each one decides how to honour them — Matching Engine attaches them as
+// query-filterable restricts; GCS persists them in the JSON record.
+func (m *MultiStore) Upsert(ctx context.Context, id string, vector []float32, metadata map[string]string, opts ...UpsertOption) error {
 	var errs []error
 	for _, s := range m.stores {
-		if err := s.Upsert(ctx, id, vector, metadata); err != nil {
+		if err := s.Upsert(ctx, id, vector, metadata, opts...); err != nil {
 			errs = append(errs, fmt.Errorf("%T: %w", s, err))
 		}
 	}
