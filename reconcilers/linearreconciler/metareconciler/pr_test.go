@@ -137,10 +137,10 @@ func TestMarkIssueComplete_TransitionsActiveToComplete(t *testing.T) {
 	}
 	saved := string(*f.lastSavedState.Load())
 	if !strings.Contains(saved, `"status":"complete"`) {
-		t.Errorf("saved state missing complete status: %s", saved)
+		t.Errorf("saved state status: got = %q, want substring %q", saved, `"status":"complete"`)
 	}
 	if !strings.Contains(saved, `"pr_url":"https://github.com/o/r/pull/1"`) {
-		t.Errorf("saved state missing pr_url: %s", saved)
+		t.Errorf("saved state pr_url: got = %q, want substring %q", saved, `"pr_url":"https://github.com/o/r/pull/1"`)
 	}
 }
 
@@ -153,7 +153,7 @@ func TestMarkIssueComplete_IdempotentWhenAlreadyComplete(t *testing.T) {
 	}
 
 	if got := f.saveCount.Load(); got != 0 {
-		t.Errorf("save count = %d, want 0 (same-status call must be a no-op)", got)
+		t.Errorf("save count: got = %d, want = 0 (same-status call must be a no-op)", got)
 	}
 }
 
@@ -174,8 +174,9 @@ func TestMarkIssueComplete_BackfillsPRURLEvenWhenAlreadyComplete(t *testing.T) {
 		t.Fatalf("save count = %d, want 1 (backfill must trigger a save)", got)
 	}
 	saved := string(*f.lastSavedState.Load())
-	if !strings.Contains(saved, `"pr_url":"`+prURL+`"`) {
-		t.Errorf("expected backfilled pr_url, got: %s", saved)
+	wantPRURL := `"pr_url":"` + prURL + `"`
+	if !strings.Contains(saved, wantPRURL) {
+		t.Errorf("saved state pr_url: got = %q, want substring %q", saved, wantPRURL)
 	}
 }
 
@@ -193,28 +194,140 @@ func TestMarkIssueComplete_BackfillsPRURLWhenAbsent(t *testing.T) {
 	}
 
 	saved := string(*f.lastSavedState.Load())
-	if !strings.Contains(saved, `"pr_url":"`+prURL+`"`) {
-		t.Errorf("expected backfilled pr_url, got: %s", saved)
+	wantPRURL := `"pr_url":"` + prURL + `"`
+	if !strings.Contains(saved, wantPRURL) {
+		t.Errorf("saved state pr_url: got = %q, want substring %q", saved, wantPRURL)
 	}
 	if !strings.Contains(saved, `"status":"complete"`) {
-		t.Errorf("expected status=complete, got: %s", saved)
+		t.Errorf("saved state status: got = %q, want substring %q", saved, `"status":"complete"`)
 	}
 }
 
-// TestDispatchMergedOrRequeue exercises the merge-gate decision: a merged PR
-// must mark the linked issue StatusComplete and skip the re-queue, while any
-// other PR state must re-queue and leave materializer state untouched.
+func TestMarkIssueFailed_TransitionsActiveToFailed(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	client := f.newClient(t)
+
+	if err := markIssueFailed(t.Context(), client, f.issue.ID, "https://github.com/o/r/pull/1", FailureModePRClosed); err != nil {
+		t.Fatalf("markIssueFailed: %v", err)
+	}
+
+	if got := f.saveCount.Load(); got != 1 {
+		t.Fatalf("save count = %d, want 1", got)
+	}
+	saved := string(*f.lastSavedState.Load())
+	if !strings.Contains(saved, `"status":"failed"`) {
+		t.Errorf("saved state status: got = %q, want substring %q", saved, `"status":"failed"`)
+	}
+	if !strings.Contains(saved, `"failure_mode":"pr_closed"`) {
+		t.Errorf("saved state failure_mode: got = %q, want substring %q", saved, `"failure_mode":"pr_closed"`)
+	}
+}
+
+func TestMarkIssueFailed_IdempotentWhenSameModeAndStatus(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"max_turns"}`)
+	client := f.newClient(t)
+
+	if err := markIssueFailed(t.Context(), client, f.issue.ID, "https://github.com/o/r/pull/1", FailureModeMaxTurns); err != nil {
+		t.Fatalf("markIssueFailed: %v", err)
+	}
+
+	if got := f.saveCount.Load(); got != 0 {
+		t.Errorf("save count: got = %d, want = 0 (same status+mode call must be a no-op)", got)
+	}
+}
+
+// TestMarkIssueFailed_ReclassifiesMode covers the case where the same issue
+// re-enters the failure path with a different FailureMode (e.g. an earlier
+// max_turns gets reclassified by a future detection rule). The save MUST
+// happen so observability sees the new classification.
+func TestMarkIssueFailed_ReclassifiesMode(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"max_turns"}`)
+	client := f.newClient(t)
+
+	if err := markIssueFailed(t.Context(), client, f.issue.ID, "https://github.com/o/r/pull/1", FailureModePRClosed); err != nil {
+		t.Fatalf("markIssueFailed: %v", err)
+	}
+
+	if got := f.saveCount.Load(); got != 1 {
+		t.Fatalf("save count = %d, want 1 (mode change must persist)", got)
+	}
+	saved := string(*f.lastSavedState.Load())
+	if !strings.Contains(saved, `"failure_mode":"pr_closed"`) {
+		t.Errorf("saved state failure_mode: got = %q, want substring %q", saved, `"failure_mode":"pr_closed"`)
+	}
+}
+
+// TestMarkIssueFailed_BackfillsPRURLEvenWhenAlreadyFailed mirrors the
+// markIssueComplete equivalent: a state already at StatusFailed but missing
+// PRURL must still be repaired by a later call.
+func TestMarkIssueFailed_BackfillsPRURLEvenWhenAlreadyFailed(t *testing.T) {
+	f := newLinearStateFixture(t, `{"status":"failed","failure_mode":"pr_closed"}`)
+	client := f.newClient(t)
+
+	const prURL = "https://github.com/o/r/pull/77"
+	if err := markIssueFailed(t.Context(), client, f.issue.ID, prURL, FailureModePRClosed); err != nil {
+		t.Fatalf("markIssueFailed: %v", err)
+	}
+
+	if got := f.saveCount.Load(); got != 1 {
+		t.Fatalf("save count = %d, want 1 (backfill must trigger a save)", got)
+	}
+	saved := string(*f.lastSavedState.Load())
+	wantPRURL := `"pr_url":"` + prURL + `"`
+	if !strings.Contains(saved, wantPRURL) {
+		t.Errorf("saved state pr_url: got = %q, want substring %q", saved, wantPRURL)
+	}
+}
+
+// TestDispatchMergedOrRequeue exercises the three-way decision in
+// dispatchMergedOrRequeue: a merged PR must persist StatusComplete, a
+// closed-without-merge PR must persist StatusFailed/pr_closed, and an
+// open PR must re-queue without touching state.
 func TestDispatchMergedOrRequeue(t *testing.T) {
 	const prURL = "https://github.com/o/r/pull/1"
 
 	tests := []struct {
 		name            string
 		merged          bool
+		state           string // GitHub PR state: "open" or "closed"
 		wantRequeueKeys int
 		wantSaveCount   int32
+		wantStatusJSON  string // substring expected in the saved state, if any save happened
 	}{
-		{name: "merged → mark complete, no requeue", merged: true, wantRequeueKeys: 0, wantSaveCount: 1},
-		{name: "not merged → requeue, no state change", merged: false, wantRequeueKeys: 1, wantSaveCount: 0},
+		{
+			name:            "merged → mark complete, no requeue",
+			merged:          true,
+			state:           "closed", // merged PRs are also closed
+			wantRequeueKeys: 0,
+			wantSaveCount:   1,
+			wantStatusJSON:  `"status":"complete"`,
+		},
+		{
+			// Defensive case: GitHub never returns merged=true with state=open
+			// in practice, but locking this in guards against future refactors
+			// that could reorder the merged/closed branches in dispatchMergedOrRequeue.
+			name:            "merged with state=open (defensive) → mark complete, no requeue",
+			merged:          true,
+			state:           "open",
+			wantRequeueKeys: 0,
+			wantSaveCount:   1,
+			wantStatusJSON:  `"status":"complete"`,
+		},
+		{
+			name:            "closed without merge → mark failed (pr_closed), no requeue",
+			merged:          false,
+			state:           "closed",
+			wantRequeueKeys: 0,
+			wantSaveCount:   1,
+			wantStatusJSON:  `"status":"failed"`,
+		},
+		{
+			name:            "open PR → requeue, no state change",
+			merged:          false,
+			state:           "open",
+			wantRequeueKeys: 1,
+			wantSaveCount:   0,
+		},
 	}
 
 	for _, tc := range tests {
@@ -222,22 +335,25 @@ func TestDispatchMergedOrRequeue(t *testing.T) {
 			f := newLinearStateFixture(t, `{"pr_url":"`+prURL+`","status":"active"}`)
 			client := f.newClient(t)
 
-			pr := &github.PullRequest{Merged: github.Ptr(tc.merged)}
+			pr := &github.PullRequest{
+				Merged: github.Ptr(tc.merged),
+				State:  github.Ptr(tc.state),
+			}
 			resp, err := dispatchMergedOrRequeue(t.Context(), pr, client, f.issue.ID, prURL)
 			if err != nil {
 				t.Fatalf("dispatchMergedOrRequeue: %v", err)
 			}
 
 			if got := len(resp.QueueKeys); got != tc.wantRequeueKeys {
-				t.Errorf("len(QueueKeys) = %d, want %d", got, tc.wantRequeueKeys)
+				t.Errorf("len(QueueKeys): got = %d, want = %d", got, tc.wantRequeueKeys)
 			}
 			if got := f.saveCount.Load(); got != tc.wantSaveCount {
-				t.Errorf("save count = %d, want %d", got, tc.wantSaveCount)
+				t.Errorf("save count: got = %d, want = %d", got, tc.wantSaveCount)
 			}
-			if tc.merged {
+			if tc.wantStatusJSON != "" {
 				saved := string(*f.lastSavedState.Load())
-				if !strings.Contains(saved, `"status":"complete"`) {
-					t.Errorf("merged path must persist status=complete, got: %s", saved)
+				if !strings.Contains(saved, tc.wantStatusJSON) {
+					t.Errorf("saved state: got = %q, want substring %q", saved, tc.wantStatusJSON)
 				}
 			}
 		})

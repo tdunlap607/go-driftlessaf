@@ -89,8 +89,17 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 
 	case state.HitMaxCommits():
 		clog.InfoContext(ctx, "PR hit turn limit")
-		_, err := changeSession.ApplyTurnLimit(ctx)
-		return err
+		// ApplyTurnLimit is idempotent: re-running it on workqueue retry
+		// short-circuits when the turn-limit label is already present
+		// (changemanager/session.go:208-211). It also returns the PR URL,
+		// which we pass to markIssueFailed so the failed state is always
+		// self-contained — no reliance on a prior StatusActive Save having
+		// populated PRURL.
+		prURL, err := changeSession.ApplyTurnLimit(ctx)
+		if err != nil {
+			return err
+		}
+		return markIssueFailed(ctx, r.linearClient, issue.ID, prURL, FailureModeMaxTurns)
 
 	case state.HasFindings():
 		clog.InfoContext(ctx, "PR has CI findings, iterating", "findings", len(changeSession.Findings()))
