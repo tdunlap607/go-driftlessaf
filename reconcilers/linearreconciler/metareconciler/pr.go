@@ -10,8 +10,10 @@ import (
 	"fmt"
 
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
+	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
 	"chainguard.dev/driftlessaf/workqueue"
 	"github.com/chainguard-dev/clog"
+	"github.com/google/go-github/v84/github"
 )
 
 // HandlePREvent processes a GitHub PR URL by extracting the Linear issue ID
@@ -62,8 +64,75 @@ func (r *Reconciler[Req, Resp, CB]) HandlePREvent(ctx context.Context, prURL str
 		return &workqueue.ProcessResponse{}, nil
 	}
 
-	clog.InfoContext(ctx, "Re-queuing Linear issue from PR event", "linear_issue_id", data.LinearIssueID)
+	return dispatchMergedOrRequeue(ctx, pr, r.linearClient, data.LinearIssueID, prURL)
+}
+
+// dispatchMergedOrRequeue picks between two PR-event responses:
+//   - merged PR → mark the linked Linear issue StatusComplete, no re-queue
+//     (a merged PR has nothing for the agent to do, and skipping the re-queue
+//     avoids burning a clone lease)
+//   - any other PR state → re-queue the Linear issue for the standard
+//     reconcile loop (review threads, CI iteration, etc.)
+//
+// Extracted from HandlePREvent so the merge gate is unit-testable without
+// wiring up a real GitHub client.
+func dispatchMergedOrRequeue(ctx context.Context, pr *github.PullRequest, client *linearreconciler.Client, linearIssueID, prURL string) (*workqueue.ProcessResponse, error) {
+	if pr.GetMerged() {
+		if err := markIssueComplete(ctx, client, linearIssueID, prURL); err != nil {
+			return nil, fmt.Errorf("mark issue complete: %w", err)
+		}
+		return &workqueue.ProcessResponse{}, nil
+	}
+	clog.InfoContext(ctx, "Re-queuing Linear issue from PR event", "linear_issue_id", linearIssueID)
 	return &workqueue.ProcessResponse{
-		QueueKeys: []*workqueue.QueueKeyRequest{{Key: data.LinearIssueID}},
+		QueueKeys: []*workqueue.QueueKeyRequest{{Key: linearIssueID}},
 	}, nil
+}
+
+// markIssueComplete sets MaterializerState.Status to StatusComplete on the
+// given Linear issue and backfills PRURL when the loaded state has none
+// (which happens when the triggering event is the first signal we see for
+// an issue — e.g. someone manually merged a PR whose materializer_state
+// attachment never received a StatusActive write).
+//
+// Save is skipped when nothing would change (already complete AND PRURL is
+// already populated), so repeated event arrivals are cheap.
+//
+// Concurrency: there's a known lost-update window with reconcileIssue's
+// StatusActive writes (StateManager.Save is delete-then-create, not atomic).
+// Benign in practice because StatusComplete is terminal — downstream readers
+// stop reacting once they see it — but a CAS / version field on
+// MaterializerState would make this airtight if needed.
+func markIssueComplete(ctx context.Context, client *linearreconciler.Client, linearIssueID, prURL string) error {
+	issue, err := client.GetIssue(ctx, linearIssueID)
+	if err != nil {
+		return fmt.Errorf("fetch issue: %w", err)
+	}
+	sm := client.NewStateManager(issue)
+	var state MaterializerState
+	if _, err := sm.Load(ctx, &state); err != nil {
+		return fmt.Errorf("load materializer state: %w", err)
+	}
+
+	// Compute changes first so the already-complete case still backfills
+	// PRURL when it's missing — without this ordering a
+	// `{Status: complete, PRURL: ""}` state could never be repaired.
+	dirty := false
+	if state.PRURL == "" && prURL != "" {
+		state.PRURL = prURL
+		dirty = true
+	}
+	if state.Status != StatusComplete {
+		state.Status = StatusComplete
+		dirty = true
+	}
+	if !dirty {
+		return nil
+	}
+
+	if err := sm.Save(ctx, &state); err != nil {
+		return fmt.Errorf("save materializer state: %w", err)
+	}
+	clog.InfoContext(ctx, "Materializer state set to complete", "linear_issue_id", linearIssueID, "pr_url", prURL)
+	return nil
 }

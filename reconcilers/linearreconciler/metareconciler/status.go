@@ -13,7 +13,7 @@ type Status string
 // Status values persisted on the Linear issue's state attachment.
 const (
 	StatusActive         Status = "active"
-	StatusGreen          Status = "green"
+	StatusComplete       Status = "complete"
 	StatusFailed         Status = "failed"
 	StatusWaitingForRepo Status = "waiting_for_repo"
 )
