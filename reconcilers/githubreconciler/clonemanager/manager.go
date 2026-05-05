@@ -347,14 +347,6 @@ func (m *Manager) prepareClone(ctx context.Context, cl *clone, ref string, res *
 		clog.DebugContextf(ctx, "Path %s exists at commit %s", res.Path, remoteRef.Hash().String())
 	}
 
-	status, err := worktree.Status()
-	if err != nil {
-		return remoteRef.Hash().String(), false, fmt.Errorf("getting worktree status: %w", err)
-	}
-	if !status.IsClean() {
-		return remoteRef.Hash().String(), false, errors.New("worktree is not clean after checkout")
-	}
-
 	return remoteRef.Hash().String(), true, nil
 }
 
