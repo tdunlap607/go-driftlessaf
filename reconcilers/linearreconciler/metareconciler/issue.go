@@ -27,7 +27,7 @@ const (
 // reconcileIssue resolves the repo target from the Linear issue, then runs the
 // agent to create/update a GitHub PR. The state machine mirrors
 // githubreconciler/metareconciler/issue.go.
-func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *linearreconciler.Issue) error {
+func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, issue *linearreconciler.Issue) error {
 	ctx = clog.WithValues(ctx, "identifier", issue.Identifier, "title", issue.Title)
 
 	// Check label gate.
@@ -78,7 +78,12 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 		return fmt.Errorf("create change session: %w", err)
 	}
 	state := changeSession.State()
-	var usePRBranch bool
+	var (
+		usePRBranch bool
+		// trigger classifies why the agent is being invoked, recorded on the
+		// History entry produced by the StatusActive transition below.
+		trigger string
+	)
 	switch {
 	case changeSession.ShouldSkip():
 		clog.InfoContext(ctx, "PR should be skipped, not updating")
@@ -86,24 +91,39 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 
 	case state.NeedsRebase():
 		clog.InfoContext(ctx, "PR needs rebase, starting fresh from default branch")
+		trigger = TriggerMergeConflict
 
 	case state.HitMaxCommits():
 		clog.InfoContext(ctx, "PR hit turn limit")
 		// ApplyTurnLimit is idempotent: re-running it on workqueue retry
 		// short-circuits when the turn-limit label is already present
 		// (changemanager/session.go:208-211). It also returns the PR URL,
-		// which we pass to markIssueFailed so the failed state is always
-		// self-contained — no reliance on a prior StatusActive Save having
-		// populated PRURL.
+		// which we set on state alongside StatusFailed so the failed state
+		// is always self-contained — no reliance on a prior StatusActive
+		// Save having populated PRURL.
 		prURL, err := changeSession.ApplyTurnLimit(ctx)
 		if err != nil {
 			return err
 		}
-		return markIssueFailed(ctx, r.linearClient, issue.ID, prURL, FailureModeMaxTurns)
+		mgr := r.NewStateManager(issue)
+		s, _, err := mgr.Load(ctx)
+		if err != nil {
+			return fmt.Errorf("load state: %w", err)
+		}
+		s.SetStatus(StatusFailed)
+		s.SetFailureMode(FailureModeMaxTurns)
+		if s.GetPRURL() == "" {
+			s.SetPRURL(prURL)
+		}
+		ctx = WithActor(ctx, r.identity)
+		ctx = WithTrigger(ctx, TriggerMaxTurns)
+		_, err = mgr.Save(ctx, s)
+		return err
 
 	case state.HasFindings():
 		clog.InfoContext(ctx, "PR has CI findings, iterating", "findings", len(changeSession.Findings()))
 		usePRBranch = true
+		trigger = TriggerCIFailureIteration
 
 	case state.HasPendingChecks():
 		clog.InfoContext(ctx, "PR has pending checks, skipping", "pending_checks", changeSession.PendingChecks())
@@ -115,9 +135,11 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 		// issue description was edited, the agent re-runs in iteration mode.
 		clog.InfoContext(ctx, "PR is green, checking for description changes")
 		usePRBranch = true
+		trigger = TriggerDescriptionEditIteration
 
 	case !state.HasPR():
 		clog.InfoContext(ctx, "No existing PR, creating from scratch")
+		trigger = TriggerInitialRun
 
 	default:
 		// Don't fall through to Upsert on an unrecognised state combination —
@@ -132,6 +154,13 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
+
+	// agentRan tracks whether the inner callback (and therefore the agent)
+	// actually executed. Upsert is a no-op when nothing changed (e.g. the
+	// description hash is unchanged on the HasNoConflicts path); in that
+	// case we want to avoid stamping the History entry with a trigger that
+	// implies an iteration that never happened.
+	var agentRan bool
 
 	// Create/update the PR with the changes.
 	prURL, err := changeSession.Upsert(ctx, &PRData[Req]{
@@ -177,7 +206,14 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 				return "", fmt.Errorf("build callbacks: %w", err)
 			}
 
-			result, err := r.agent.Execute(ctx, request, cbs)
+			// Inject Linear-issue-id and trigger into context so bot-side
+			// agent decorators (telemetry capture etc.) can correlate log
+			// events without piggy-backing on the agent's request struct.
+			agentCtx := WithLinearIssueID(ctx, issue.ID)
+			agentCtx = WithTrigger(agentCtx, trigger)
+
+			agentRan = true
+			result, err := r.agent.Execute(agentCtx, request, cbs)
 			if err != nil {
 				return "", fmt.Errorf("execute agent: %w", err)
 			}
@@ -188,30 +224,36 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, issue *l
 		return fmt.Errorf("upsert PR: %w", err)
 	}
 
-	// Only update Linear status if the PR URL is new or changed.
-	// Updating status on every reconciliation creates a feedback loop:
-	// status update → attachment/comment event → re-reconcile → repeat.
-	sm := r.linearClient.NewStateManager(issue)
-	var existingState MaterializerState
-	loaded, loadErr := sm.Load(ctx, &existingState)
-	if loadErr != nil {
-		// Treating Load failure as "no prior state" would re-post the bot
-		// comment on every retry until Load eventually succeeds — exactly
-		// the spam loop the surrounding logic exists to prevent. Return
-		// retriable so the workqueue backs off without leaking comments.
-		return fmt.Errorf("load materializer state: %w", loadErr)
+	// If Upsert was a no-op (description hash unchanged on the
+	// HasNoConflicts branch, etc.), the agent never ran — clear the trigger
+	// so any History entry that fires (e.g. from a PRURL backfill) doesn't
+	// claim an iteration that didn't happen.
+	if !agentRan {
+		trigger = ""
 	}
-	if !loaded || existingState.PRURL != prURL {
-		existingState.PRURL = prURL
-		existingState.Status = StatusActive
-		// Save BEFORE posting the comment: if Save fails and we'd already
-		// commented, the next reconcile would see no saved state and
-		// comment again. Returning here keeps state and comment in sync.
-		if err := sm.Save(ctx, &existingState); err != nil {
-			return fmt.Errorf("save materializer state: %w", err)
-		}
+
+	// StateManager.Save's (changed bool) gate is the gate for the bot
+	// comment too: same status + same PRURL = no-op (no save, no comment,
+	// no feedback loop on every reconcile). A fresh or recreated PR
+	// triggers both. Save BEFORE posting the comment: if Save failed and
+	// we'd already commented, the next reconcile would see no saved state
+	// and comment again.
+	mgr := r.NewStateManager(issue)
+	s, _, err := mgr.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+	s.SetStatus(StatusActive)
+	s.SetPRURL(prURL) // overwrite — fresh reconcile reflects the current PR
+	ctx = WithActor(ctx, r.identity)
+	ctx = WithTrigger(ctx, trigger)
+	changed, err := mgr.Save(ctx, s)
+	if err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+	if changed {
 		body := fmt.Sprintf("PR created/updated: %s", prURL)
-		if err := sm.UpsertBotComment(ctx, body); err != nil {
+		if err := mgr.UpsertBotComment(ctx, body); err != nil {
 			// State is saved; missing the comment is annoying but not
 			// catastrophic. Best-effort.
 			clog.WarnContext(ctx, "Failed to upsert bot comment", "error", err)

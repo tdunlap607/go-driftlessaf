@@ -50,7 +50,10 @@ func Example_construction() {
 		githubClients *githubreconciler.ClientCache
 	)
 
-	rec := metareconciler.New(
+	// State type params (T, PT) cannot be inferred from arguments, so they
+	// must be spelled out explicitly. metareconciler.State is the default
+	// for bots that don't add bot-specific state fields.
+	rec := metareconciler.New[*myRequest, *myResult, baseCallbacks, metareconciler.State, *metareconciler.State](
 		"my-bot",
 		cm,
 		cloneMeta,
@@ -86,7 +89,7 @@ func Example_withRequiredLabel() {
 	)
 
 	identity := "my-bot"
-	rec := metareconciler.New(
+	rec := metareconciler.New[*myRequest, *myResult, baseCallbacks, metareconciler.State, *metareconciler.State](
 		identity,
 		cm,
 		cloneMeta,

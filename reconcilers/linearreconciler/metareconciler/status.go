@@ -5,22 +5,25 @@ SPDX-License-Identifier: Apache-2.0
 
 package metareconciler
 
-// Status is the materializer's progress state on a Linear issue. It is a
-// distinct string type so callers cannot assign arbitrary strings (typos
+import "time"
+
+// Status is a Linear-issue-driven reconciler's progress state on an issue. It
+// is a distinct string type so callers cannot assign arbitrary strings (typos
 // like "actve" become compile-time errors).
 type Status string
 
-// Status values persisted on the Linear issue's state attachment.
+// Framework-defined Status values, set by the framework's reconcile flow.
+// Bots that need additional statuses for bot-driven phases declare them as
+// `const MyStatus metareconciler.Status = "..."` in the bot package.
 const (
-	StatusActive         Status = "active"
-	StatusComplete       Status = "complete"
-	StatusFailed         Status = "failed"
-	StatusWaitingForRepo Status = "waiting_for_repo"
+	StatusActive   Status = "active"
+	StatusComplete Status = "complete"
+	StatusFailed   Status = "failed"
 )
 
-// FailureMode classifies why MaterializerState landed on StatusFailed.
-// Only the modes we have detection paths for today are defined; new modes
-// are added when their detection logic lands.
+// FailureMode classifies why a State landed on StatusFailed. Only the modes
+// we have detection paths for today are defined; new modes are added when
+// their detection logic lands.
 type FailureMode string
 
 // FailureMode values persisted alongside StatusFailed on the state attachment.
@@ -33,11 +36,121 @@ const (
 	FailureModePRClosed FailureMode = "pr_closed"
 )
 
-// MaterializerState tracks the materializer's progress on a Linear issue.
-// This is persisted as a file attachment on the issue via the StateManager
-// with the "materializer" prefix.
-type MaterializerState struct {
-	PRURL       string      `json:"pr_url,omitempty"`
-	Status      Status      `json:"status,omitempty"`
-	FailureMode FailureMode `json:"failure_mode,omitempty"`
+// Trigger values the framework records on State.History entries.
+// Downstream consumers of the persisted state can match against these
+// constants rather than hardcoding strings. Bots are free to define their
+// own additional trigger constants for transitions they drive themselves.
+const (
+	// TriggerInitialRun is the trigger for the first reconcile of an issue:
+	// no PR exists yet, the agent is being invoked from scratch.
+	TriggerInitialRun = "initial_run"
+	// TriggerCIFailureIteration is the trigger for re-running the agent
+	// because the existing PR has CI failures to address.
+	TriggerCIFailureIteration = "ci_failure_iteration"
+	// TriggerDescriptionEditIteration is the trigger for re-running the
+	// agent because the Linear issue description changed since the last
+	// successful PR.
+	TriggerDescriptionEditIteration = "description_edit_iteration"
+	// TriggerMergeConflict is the trigger when the existing PR has merge
+	// conflicts with its base branch and the agent is being invoked to
+	// regenerate from a fresh checkout of the default branch.
+	TriggerMergeConflict = "merge_conflict"
+	// TriggerMaxTurns is the trigger recorded when the agent has hit its
+	// commit budget on a PR; the issue transitions to StatusFailed with
+	// FailureModeMaxTurns.
+	TriggerMaxTurns = "max_turns"
+	// TriggerPRMerge is the trigger when a PR-event handler observes a
+	// merged PR; the issue transitions to StatusComplete.
+	TriggerPRMerge = "pr_merge"
+	// TriggerPRClosed is the trigger when a PR-event handler observes a
+	// closed-without-merge PR; the issue transitions to StatusFailed with
+	// FailureModePRClosed.
+	TriggerPRClosed = "pr_closed"
+)
+
+// State is the framework's persistent state-machine record for a single
+// Linear issue. Bots that need bot-specific fields define their own State
+// type that value-embeds this one; the embedded fields are promoted to the
+// top level of the JSON serialization, so a bot's wrapper persists as a
+// single flat blob in one Linear attachment.
+//
+// History is appended automatically by StateManager.Save when Status or
+// FailureMode changes — callers do not write to it directly.
+type State struct {
+	PRURL       string            `json:"pr_url,omitempty"`
+	Status      Status            `json:"status,omitempty"`
+	FailureMode FailureMode       `json:"failure_mode,omitempty"`
+	History     []StateTransition `json:"history,omitempty"`
+}
+
+// GetStatus returns the current Status. Part of the StateMachine interface.
+func (s *State) GetStatus() Status { return s.Status }
+
+// SetStatus sets the Status. Part of the StateMachine interface.
+func (s *State) SetStatus(st Status) { s.Status = st }
+
+// GetPRURL returns the current PRURL. Part of the StateMachine interface.
+func (s *State) GetPRURL() string { return s.PRURL }
+
+// SetPRURL sets the PRURL. Part of the StateMachine interface.
+func (s *State) SetPRURL(u string) { s.PRURL = u }
+
+// GetFailureMode returns the current FailureMode. Part of the StateMachine interface.
+func (s *State) GetFailureMode() FailureMode { return s.FailureMode }
+
+// SetFailureMode sets the FailureMode. Part of the StateMachine interface.
+func (s *State) SetFailureMode(fm FailureMode) { s.FailureMode = fm }
+
+// historyCap bounds State.History to keep the persisted attachment well
+// below Linear's per-attachment limit (~10MB; see maxAttachmentSize in
+// linearreconciler/client.go). At ~250 bytes per StateTransition, 200
+// entries is ~50KB. When the cap is exceeded, the oldest entries are
+// dropped (FIFO). Downstream mirrors are the place to keep unbounded
+// transition history for analytics.
+const historyCap = 200
+
+// AppendHistory appends a StateTransition to History, FIFO-evicting the
+// oldest entries when the slice exceeds historyCap. Part of the StateMachine
+// interface. Callers should generally not invoke this directly —
+// StateManager.Save appends transitions automatically when Status or
+// FailureMode changes.
+func (s *State) AppendHistory(t StateTransition) {
+	s.History = append(s.History, t)
+	if len(s.History) > historyCap {
+		s.History = s.History[len(s.History)-historyCap:]
+	}
+}
+
+// StateMachine is the contract a bot's State type must satisfy to be managed
+// by StateManager. It is satisfied automatically when a bot's wrapper struct
+// value-embeds State (or pointer-embeds *State).
+type StateMachine interface {
+	GetStatus() Status
+	SetStatus(Status)
+	GetPRURL() string
+	SetPRURL(string)
+	GetFailureMode() FailureMode
+	SetFailureMode(FailureMode)
+	AppendHistory(StateTransition)
+}
+
+// StateConstraint is the generic constraint linking a value type T to its
+// pointer type *T satisfying StateMachine. Generic functions in this package
+// use the (T, PT) pair so they can construct fresh instances via `var t T;
+// pt := PT(&t)` while still calling pointer-receiver methods through PT.
+type StateConstraint[T any] interface {
+	*T
+	StateMachine
+}
+
+// StateTransition records a single Status (and optional FailureMode) change.
+// Append-only via StateManager.Save's automatic diff detection.
+type StateTransition struct {
+	From    Status      `json:"from,omitempty"`
+	To      Status      `json:"to"`
+	At      time.Time   `json:"at"`
+	Actor   string      `json:"actor,omitempty"`   // bot identity, or "manual" for human edits
+	Trigger string      `json:"trigger,omitempty"` // e.g. "pr_merge", "pr_closed", "max_turns"
+	Note    string      `json:"note,omitempty"`
+	Mode    FailureMode `json:"mode,omitempty"` // populated alongside To=StatusFailed
 }

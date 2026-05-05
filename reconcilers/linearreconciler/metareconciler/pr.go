@@ -10,7 +10,6 @@ import (
 	"fmt"
 
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
-	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
 	"chainguard.dev/driftlessaf/workqueue"
 	"github.com/chainguard-dev/clog"
 	"github.com/google/go-github/v84/github"
@@ -24,7 +23,7 @@ import (
 // ENG-123) because the linear-events trampoline keys workqueue items by UUID
 // (see linear-metareconciler module: extension_key = "issueid"). Using the
 // UUID keeps the two paths consistent so the workqueue can dedupe.
-func (r *Reconciler[Req, Resp, CB]) HandlePREvent(ctx context.Context, prURL string) (*workqueue.ProcessResponse, error) {
+func (r *Reconciler[Req, Resp, CB, T, PT]) HandlePREvent(ctx context.Context, prURL string) (*workqueue.ProcessResponse, error) {
 	ctx = clog.WithValues(ctx, "pr_url", prURL)
 
 	res, err := githubreconciler.ParseURL(prURL)
@@ -64,33 +63,28 @@ func (r *Reconciler[Req, Resp, CB]) HandlePREvent(ctx context.Context, prURL str
 		return &workqueue.ProcessResponse{}, nil
 	}
 
-	return dispatchMergedOrRequeue(ctx, pr, r.linearClient, data.LinearIssueID, prURL)
+	return r.dispatchMergedOrRequeue(ctx, pr, data.LinearIssueID, prURL)
 }
 
 // dispatchMergedOrRequeue picks between three PR-event responses:
-//   - merged PR → mark the linked Linear issue StatusComplete, no re-queue
-//     (a merged PR has nothing for the agent to do, and skipping the re-queue
-//     avoids burning a clone lease)
-//   - closed PR (without merge) → mark the linked issue StatusFailed with
-//     FailureModePRClosed, no re-queue (a human abandoned the work; reviving
-//     the PR forever is the wrong response)
+//   - merged PR → transition the linked Linear issue to StatusComplete,
+//     no re-queue (a merged PR has nothing for the agent to do, and
+//     skipping the re-queue avoids burning a clone lease)
+//   - closed PR (without merge) → transition to StatusFailed with
+//     FailureModePRClosed, no re-queue (a human abandoned the work;
+//     reviving the PR forever is the wrong response)
 //   - open PR → re-queue the Linear issue for the standard reconcile loop
 //     (review threads, CI iteration, etc.)
 //
-// Extracted from HandlePREvent so the gate is unit-testable without wiring
-// up a real GitHub client.
-func dispatchMergedOrRequeue(ctx context.Context, pr *github.PullRequest, client *linearreconciler.Client, linearIssueID, prURL string) (*workqueue.ProcessResponse, error) {
+// A method on *Reconciler so it can use the configured linearClient and
+// identity directly, and so the StateManager pattern is uniform with
+// reconcileIssue.
+func (r *Reconciler[Req, Resp, CB, T, PT]) dispatchMergedOrRequeue(ctx context.Context, pr *github.PullRequest, linearIssueID, prURL string) (*workqueue.ProcessResponse, error) {
 	switch {
 	case pr.GetMerged():
-		if err := markIssueComplete(ctx, client, linearIssueID, prURL); err != nil {
-			return nil, fmt.Errorf("mark issue complete: %w", err)
-		}
-		return &workqueue.ProcessResponse{}, nil
+		return r.transitionPR(ctx, linearIssueID, prURL, StatusComplete, "", TriggerPRMerge)
 	case pr.GetState() == "closed":
-		if err := markIssueFailed(ctx, client, linearIssueID, prURL, FailureModePRClosed); err != nil {
-			return nil, fmt.Errorf("mark issue failed (%s): %w", FailureModePRClosed, err)
-		}
-		return &workqueue.ProcessResponse{}, nil
+		return r.transitionPR(ctx, linearIssueID, prURL, StatusFailed, FailureModePRClosed, TriggerPRClosed)
 	default:
 		clog.InfoContext(ctx, "Re-queuing Linear issue from PR event", "linear_issue_id", linearIssueID)
 		return &workqueue.ProcessResponse{
@@ -99,97 +93,33 @@ func dispatchMergedOrRequeue(ctx context.Context, pr *github.PullRequest, client
 	}
 }
 
-// markIssueComplete sets MaterializerState.Status to StatusComplete on the
-// given Linear issue and backfills PRURL when the loaded state has none
-// (which happens when the triggering event is the first signal we see for
-// an issue — e.g. someone manually merged a PR whose materializer_state
-// attachment never received a StatusActive write).
-//
-// Save is skipped when nothing would change (already complete AND PRURL is
-// already populated), so repeated event arrivals are cheap.
-//
-// Concurrency: there's a known lost-update window with reconcileIssue's
-// StatusActive writes (StateManager.Save is delete-then-create, not atomic).
-// Benign in practice because StatusComplete is terminal — downstream readers
-// stop reacting once they see it — but a CAS / version field on
-// MaterializerState would make this airtight if needed.
-func markIssueComplete(ctx context.Context, client *linearreconciler.Client, linearIssueID, prURL string) error {
-	issue, err := client.GetIssue(ctx, linearIssueID)
+// transitionPR loads the issue's state, sets Status (and optional FailureMode),
+// backfills PRURL when missing (events may arrive in unpredictable order so
+// first-write-wins for PRURL on event-driven paths), and saves. The History
+// append is automatic in StateManager.Save based on the diff against Load.
+func (r *Reconciler[Req, Resp, CB, T, PT]) transitionPR(ctx context.Context, linearIssueID, prURL string, to Status, mode FailureMode, trigger string) (*workqueue.ProcessResponse, error) {
+	issue, err := r.linearClient.GetIssue(ctx, linearIssueID)
 	if err != nil {
-		return fmt.Errorf("fetch issue: %w", err)
+		return nil, fmt.Errorf("fetch issue: %w", err)
 	}
-	sm := client.NewStateManager(issue)
-	var state MaterializerState
-	if _, err := sm.Load(ctx, &state); err != nil {
-		return fmt.Errorf("load materializer state: %w", err)
-	}
-
-	// Compute changes first so the already-complete case still backfills
-	// PRURL when it's missing — without this ordering a
-	// `{Status: complete, PRURL: ""}` state could never be repaired.
-	dirty := false
-	if state.PRURL == "" && prURL != "" {
-		state.PRURL = prURL
-		dirty = true
-	}
-	if state.Status != StatusComplete {
-		state.Status = StatusComplete
-		dirty = true
-	}
-	if !dirty {
-		return nil
-	}
-
-	if err := sm.Save(ctx, &state); err != nil {
-		return fmt.Errorf("save materializer state: %w", err)
-	}
-	clog.InfoContext(ctx, "Materializer state set to complete", "linear_issue_id", linearIssueID, "pr_url", prURL)
-	return nil
-}
-
-// markIssueFailed sets MaterializerState.Status to StatusFailed with the
-// given FailureMode on the linked Linear issue, and backfills PRURL when
-// the loaded state has none. Mirrors markIssueComplete's shape exactly,
-// except it carries the FailureMode classification.
-//
-// Save is skipped when nothing would change (already failed with the same
-// mode AND PRURL is already populated). A different FailureMode IS a
-// change worth persisting — lets a re-classification land without
-// requiring an explicit reset.
-//
-// Concurrency: same lost-update window as markIssueComplete (StateManager.Save
-// is delete-then-create). Benign for terminal statuses.
-func markIssueFailed(ctx context.Context, client *linearreconciler.Client, linearIssueID, prURL string, mode FailureMode) error {
-	issue, err := client.GetIssue(ctx, linearIssueID)
+	mgr := r.NewStateManager(issue)
+	s, _, err := mgr.Load(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch issue: %w", err)
+		return nil, fmt.Errorf("load state: %w", err)
 	}
-	sm := client.NewStateManager(issue)
-	var state MaterializerState
-	if _, err := sm.Load(ctx, &state); err != nil {
-		return fmt.Errorf("load materializer state: %w", err)
+	s.SetStatus(to)
+	if mode != "" {
+		s.SetFailureMode(mode)
 	}
-
-	dirty := false
-	if state.PRURL == "" && prURL != "" {
-		state.PRURL = prURL
-		dirty = true
+	// Backfill PRURL only — events arrive in unpredictable order; a prior
+	// reconcile may have already written the canonical URL.
+	if s.GetPRURL() == "" {
+		s.SetPRURL(prURL)
 	}
-	if state.Status != StatusFailed {
-		state.Status = StatusFailed
-		dirty = true
+	ctx = WithActor(ctx, r.identity)
+	ctx = WithTrigger(ctx, trigger)
+	if _, err := mgr.Save(ctx, s); err != nil {
+		return nil, fmt.Errorf("save state: %w", err)
 	}
-	if state.FailureMode != mode {
-		state.FailureMode = mode
-		dirty = true
-	}
-	if !dirty {
-		return nil
-	}
-
-	if err := sm.Save(ctx, &state); err != nil {
-		return fmt.Errorf("save materializer state: %w", err)
-	}
-	clog.InfoContext(ctx, "Materializer state set to failed", "linear_issue_id", linearIssueID, "pr_url", prURL, "failure_mode", mode)
-	return nil
+	return &workqueue.ProcessResponse{}, nil
 }

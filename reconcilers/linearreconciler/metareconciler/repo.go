@@ -17,7 +17,7 @@ import (
 // resolveRepoTarget determines the GitHub repository for a Linear issue by
 // reading the upstream bot's state attachment. Falls back to the configured
 // RepoTargetResolver if no upstream state is found.
-func (r *Reconciler[Req, Resp, CB]) resolveRepoTarget(ctx context.Context, issue *linearreconciler.Issue) (*RepoTarget, error) {
+func (r *Reconciler[Req, Resp, CB, T, PT]) resolveRepoTarget(ctx context.Context, issue *linearreconciler.Issue) (*RepoTarget, error) {
 	title := r.upstreamPrefix + "_state"
 	att := issue.FindAttachment(title)
 	if att != nil && att.URL != "" {

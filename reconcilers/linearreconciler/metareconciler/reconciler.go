@@ -22,7 +22,19 @@ import (
 // Reconciler is a generic reconciler that bridges Linear issues to GitHub PRs
 // via an AI agent. It mirrors the githubreconciler/metareconciler but uses
 // Linear as the issue source and GitHub as the code execution target.
-type Reconciler[Req promptbuilder.Bindable, Resp Result, CB any] struct {
+//
+// Type parameters:
+//
+//   - Req, Resp, CB: the agent's request, response, and callbacks types
+//     (see metaagent.Agent)
+//   - T: the bot's State value type. The bot defines a struct that
+//     value-embeds metareconciler.State (so embedded methods promote and
+//     satisfy StateMachine on *T) and adds bot-specific fields. For bots
+//     with no extras, `T = metareconciler.State` works directly.
+//   - PT: pointer-to-T constrained to satisfy StateMachine. Almost always
+//     `*T` literally; the explicit pair is needed because Go generics need
+//     to construct fresh instances via `var t T; pt := PT(&t)`.
+type Reconciler[Req promptbuilder.Bindable, Resp Result, CB any, T any, PT StateConstraint[T]] struct {
 	identity      string
 	changeManager *changemanager.CM[PRData[Req]]
 	cloneMeta     *clonemanager.Meta
@@ -83,6 +95,12 @@ func WithUpstreamPrefix(prefix string) Option {
 
 // WithRepoTargetResolver sets a fallback resolver for determining the repo
 // target from a Linear issue when no upstream bot state is available.
+//
+// Note: the resolver is invoked during reconcile, but it must be supplied
+// at construction time — which means resolvers needing a state-machine-
+// aware StateManager cannot reach for the (*Reconciler).NewStateManager
+// method (it doesn't exist yet). Use the free-function form
+// metareconciler.NewStateManager[T, *T](client, issue) instead.
 func WithRepoTargetResolver(resolver RepoTargetResolver) Option {
 	return func(o *options) {
 		o.repoTargetResolver = resolver
@@ -92,7 +110,13 @@ func WithRepoTargetResolver(resolver RepoTargetResolver) Option {
 // New creates a new Linear metareconciler. It bridges Linear issues to GitHub
 // PRs by reading repo target information from an upstream bot's state attachment
 // and using the agent to generate code changes.
-func New[Req promptbuilder.Bindable, Resp Result, CB any](
+//
+// State type parameters T and PT are usually inferred from the constructor
+// arguments at call sites that provide a buildRequest closure typed against
+// the bot's wrapper State; for explicit construction, pass them as in:
+//
+//	metareconciler.New[*Req, *Resp, CB, mybot.State, *mybot.State](...)
+func New[Req promptbuilder.Bindable, Resp Result, CB any, T any, PT StateConstraint[T]](
 	identity string,
 	changeManager *changemanager.CM[PRData[Req]],
 	cloneMeta *clonemanager.Meta,
@@ -103,12 +127,12 @@ func New[Req promptbuilder.Bindable, Resp Result, CB any](
 	linearClient *linearreconciler.Client,
 	githubClients *githubreconciler.ClientCache,
 	opts ...Option,
-) *Reconciler[Req, Resp, CB] {
+) *Reconciler[Req, Resp, CB, T, PT] {
 	o := &options{upstreamPrefix: "planner"}
 	for _, opt := range opts {
 		opt(o)
 	}
-	return &Reconciler[Req, Resp, CB]{
+	return &Reconciler[Req, Resp, CB, T, PT]{
 		identity:           identity,
 		changeManager:      changeManager,
 		cloneMeta:          cloneMeta,
@@ -132,7 +156,7 @@ func New[Req promptbuilder.Bindable, Resp Result, CB any](
 // state-attachment operations performed in helpers (resolveRepoTarget,
 // state save/load) that are called outside of this entry point. Callers
 // are expected to pass the same instance.
-func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, issue *linearreconciler.Issue, _ *linearreconciler.Client) error {
+func (r *Reconciler[Req, Resp, CB, T, PT]) Reconcile(ctx context.Context, issue *linearreconciler.Issue, _ *linearreconciler.Client) error {
 	return r.reconcileIssue(ctx, issue)
 }
 
@@ -145,7 +169,7 @@ func (r *Reconciler[Req, Resp, CB]) Reconcile(ctx context.Context, issue *linear
 //
 // This enables the CI feedback loop: PR CI fails → check_suite event →
 // PR URL queued → extract Linear issue ID → re-queue → iterate.
-func (r *Reconciler[Req, Resp, CB]) WrapWithPRHandler(linearRec workqueue.WorkqueueServiceServer) workqueue.WorkqueueServiceServer {
+func (r *Reconciler[Req, Resp, CB, T, PT]) WrapWithPRHandler(linearRec workqueue.WorkqueueServiceServer) workqueue.WorkqueueServiceServer {
 	return &dualKeyServer{
 		metaRec:   r,
 		linearRec: linearRec,
