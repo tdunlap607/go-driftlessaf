@@ -8,6 +8,8 @@ package metareconciler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -185,6 +187,59 @@ func TestStateManager_FromActiveToFailedNoDiff(t *testing.T) {
 	}
 }
 
+// TestStateManager_CurrentFindings_RoundTrip verifies that the
+// CurrentFindings snapshot persists through Save and reloads cleanly,
+// and that passing nil to Set clears stale entries from a previous
+// iteration. The reconcile loop relies on this clear-on-reset
+// behaviour so downstream consumers don't see findings that have
+// since been resolved.
+func TestStateManager_CurrentFindings_RoundTrip(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []FindingRef{
+		{Kind: "ciCheck", Identifier: "job-1", DetailsURL: "https://github.com/o/r/actions/runs/1/job/2"},
+		{Kind: "review", Identifier: "thread-9", DetailsURL: "https://github.com/o/r/pull/1#discussion_r9"},
+	}
+	s.SetCurrentFindings(want)
+	// Advance status so Save isn't a no-op.
+	s.SetStatus(StatusComplete)
+	ctx := WithActor(t.Context(), testActor)
+	ctx = WithTrigger(ctx, TriggerPRMerge)
+	if _, err := mgr.Save(ctx, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got := saved.GetCurrentFindings(); len(got) != len(want) {
+		t.Fatalf("CurrentFindings length: got = %d, want = %d", len(got), len(want))
+	}
+	for i, w := range want {
+		got := saved.GetCurrentFindings()[i]
+		if got != w {
+			t.Errorf("CurrentFindings[%d]: got = %+v, want = %+v", i, got, w)
+		}
+	}
+
+	// Clear path: passing nil drops the field.
+	s.SetCurrentFindings(nil)
+	s.SetStatus(StatusActive)
+	if _, err := mgr.Save(ctx, s); err != nil {
+		t.Fatalf("Save (clear): %v", err)
+	}
+	var cleared State
+	loadSavedState(t, f, &cleared)
+	if got := cleared.GetCurrentFindings(); got != nil {
+		t.Errorf("CurrentFindings after clear: got = %v, want = nil", got)
+	}
+}
+
 func TestStateManager_NoOpWhenSameState(t *testing.T) {
 	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"complete"}`)
 	r := newReconcilerForFixture(t, f)
@@ -290,6 +345,75 @@ func TestStateManager_PRURLOnlyChangePersists(t *testing.T) {
 	// would mislead observability. The save fires; the audit trail stays clean.
 	if got, want := len(saved.History), 0; got != want {
 		t.Errorf("History len: got = %d, want = %d (PRURL-only change must not append History)", got, want)
+	}
+}
+
+// TestStateManager_FindingsAndPendingChangesPersist is the regression test
+// for the dirty predicate covering CurrentFindings / CurrentPendingChecks.
+// Without these in the snapshot, a same-status reconcile that only updated
+// the live findings/pending snapshot would return (false, nil) and skip
+// the Linear write — leaving the source-of-truth attachment empty even
+// though the post-save callback had already pushed the new data to
+// downstream mirrors. The next reconcile's Load would then read empty
+// findings/pending from Linear and the framework would observably "lose"
+// the data on the round trip.
+func TestStateManager_FindingsAndPendingChangesPersist(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	// Status and PRURL unchanged; only findings/pending change. This is the
+	// shape produced by the saveNoDiffIterationState / savePendingChecksState
+	// paths, where the agent observed CI activity but the state machine did
+	// not transition.
+	wantFindings := []FindingRef{
+		{Kind: "ciCheck", Identifier: "job-7", DetailsURL: "https://github.com/o/r/actions/runs/1/job/7"},
+	}
+	wantPending := []string{"build", "lint"}
+	s.SetCurrentFindings(wantFindings)
+	s.SetCurrentPendingChecks(wantPending)
+
+	changed, err := mgr.Save(t.Context(), s)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed: got = false, want = true (findings/pending change must persist)")
+	}
+	if got := f.saveCount.Load(); got != 1 {
+		t.Errorf("save count: got = %d, want = 1", got)
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got := saved.GetCurrentFindings(); !slices.Equal(got, wantFindings) {
+		t.Errorf("CurrentFindings: got = %+v, want = %+v", got, wantFindings)
+	}
+	if got := saved.GetCurrentPendingChecks(); !slices.Equal(got, wantPending) {
+		t.Errorf("CurrentPendingChecks: got = %+v, want = %+v", got, wantPending)
+	}
+	// Findings/pending-only changes must NOT append a History entry — the
+	// state machine didn't transition.
+	if got, want := len(saved.History), 0; got != want {
+		t.Errorf("History len: got = %d, want = %d (findings/pending-only change must not append History)", got, want)
+	}
+
+	// Same-content re-save is a no-op: snapshots refreshed after the previous
+	// save mean nothing looks dirty this time.
+	noopChanged, err := mgr.Save(t.Context(), s)
+	if err != nil {
+		t.Fatalf("no-op Save: %v", err)
+	}
+	if noopChanged {
+		t.Errorf("no-op changed: got = true, want = false (same findings/pending must not re-write)")
+	}
+	if got := f.saveCount.Load(); got != 1 {
+		t.Errorf("save count after no-op: got = %d, want = 1", got)
 	}
 }
 
@@ -693,5 +817,36 @@ func TestStateManager_BeforeSave_DefaultIsNoOp(t *testing.T) {
 	}
 	if changed {
 		t.Errorf("changed: got = true, want = false (default BeforeSave must not force-save)")
+	}
+}
+
+// TestState_SetCurrentPendingChecks_TruncatesAndSortsAtCap locks in the
+// pendingChecksCap safety net: callers handing in more than the cap get
+// the alphabetically-first N entries, deterministically, regardless of
+// caller-supplied order. A future bump to the cap should be a one-line
+// const change here — this test guards against the cap being silently
+// removed or the sort being dropped.
+func TestState_SetCurrentPendingChecks_TruncatesAndSortsAtCap(t *testing.T) {
+	// Generate cap+10 entries in REVERSE alphabetical order so the sort
+	// has to actually do work, then assert the persisted slice is the
+	// alphabetical first cap entries.
+	const overflow = 10
+	input := make([]string, 0, pendingChecksCap+overflow)
+	for i := pendingChecksCap + overflow; i > 0; i-- {
+		input = append(input, fmt.Sprintf("check-%03d", i))
+	}
+
+	var s State
+	s.SetCurrentPendingChecks(input)
+
+	got := s.GetCurrentPendingChecks()
+	if len(got) != pendingChecksCap {
+		t.Fatalf("len: got = %d, want = %d", len(got), pendingChecksCap)
+	}
+	for i, c := range got {
+		want := fmt.Sprintf("check-%03d", i+1)
+		if c != want {
+			t.Errorf("got[%d] = %q, want = %q (entries past the cap should be the alphabetical tail)", i, c, want)
+		}
 	}
 }

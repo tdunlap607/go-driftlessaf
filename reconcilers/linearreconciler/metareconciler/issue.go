@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 
+	"chainguard.dev/driftlessaf/agents/toolcall/callbacks"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/changemanager"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/clonemanager"
@@ -150,8 +151,14 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		trigger = TriggerCIFailureIteration
 
 	case state.HasPendingChecks():
-		clog.InfoContext(ctx, "PR has pending checks, skipping", "pending_checks", changeSession.PendingChecks())
-		return nil
+		// Pending checks are GitHub's domain (still computing, or
+		// human-gated like CODEOWNERS). The agent has nothing to do
+		// here — but we still snapshot the pending-check names onto
+		// State so consumers can see what's blocking and bots'
+		// BeforeSave hooks can derive workflow phase (e.g. "agent done,
+		// only human-gated checks remain → ready for review").
+		clog.InfoContext(ctx, "PR has pending checks, recording state and skipping iteration", "pending_checks", changeSession.PendingChecks())
+		return r.savePendingChecksState(ctx, issue, changeSession.PendingChecks())
 
 	case state.HasNoConflicts():
 		// Don't return early -- fall through to Upsert which checks if the
@@ -283,11 +290,13 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 			//     produced no further changes. The PR is still valid;
 			//     we must NOT mark the issue failed and must NOT post a
 			//     misleading "no changes needed" comment that would
-			//     contradict the existing PR. Just log and return nil
-			//     so the workqueue stops retrying this reconcile.
+			//     contradict the existing PR. Snapshot the live
+			//     findings/pending the agent just observed so downstream
+			//     consumers don't see a stale pre-iteration picture, then
+			//     return nil so the workqueue stops retrying.
 			if usePRBranch {
 				clog.InfoContext(ctx, "Agent produced no diff on iteration; leaving existing PR unchanged")
-				return nil
+				return r.saveNoDiffIterationState(ctx, issue, snapshotFindings(changeSession.Findings()), changeSession.PendingChecks(), trigger)
 			}
 			clog.InfoContext(ctx, "Agent produced no diff on initial run, transitioning to no_diff failure mode")
 			return r.transitionToNoDiff(ctx, issue, agentNoDiffNote)
@@ -316,6 +325,30 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 	}
 	s.SetStatus(StatusActive)
 	s.SetPRURL(prURL) // overwrite — fresh reconcile reflects the current PR
+
+	// Snapshot the changemanager findings (CI failures + review threads)
+	// and pending checks onto State so downstream consumers can see
+	// what's failing AND what's still computing without querying GitHub
+	// independently.
+	//
+	// Findings are sticky-forever by design: only updated when the live
+	// snapshot is non-empty, so the field acts as a "last observed
+	// failures" record useful as a retrospective signal on completed or
+	// failed issues ("what was the last CI failure that blocked
+	// progress?"). The framework never clears them on Status transitions
+	// — reconciles that observe a green PR don't clobber the prior
+	// snapshot, and a terminal Save preserves the trail. Bots that want
+	// different semantics can override via SetCurrentFindings(nil) in
+	// their BeforeSave hook.
+	//
+	// Pending checks are NOT sticky — always overwritten with the live
+	// list so downstream consumers see the current pending set, not a
+	// stale snapshot from a prior iteration.
+	if newFindings := snapshotFindings(changeSession.Findings()); len(newFindings) > 0 {
+		s.SetCurrentFindings(newFindings)
+	}
+	s.SetCurrentPendingChecks(changeSession.PendingChecks())
+
 	ctx = WithActor(ctx, r.identity)
 	ctx = WithTrigger(ctx, trigger)
 	changed, err := mgr.Save(ctx, s)
@@ -377,6 +410,97 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) transitionToNoDiff(ctx context.Contex
 		clog.WarnContext(ctx, "Failed to upsert no-diff bot comment", "error", err)
 	}
 
+	if _, err := mgr.Save(ctx, s); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+	return nil
+}
+
+// snapshotFindings projects the live changemanager findings into the
+// FindingRef shape persisted on State. Returns nil for an empty input
+// so the omitempty json tag drops the field cleanly when there's
+// nothing to report.
+func snapshotFindings(findings []callbacks.Finding) []FindingRef {
+	if len(findings) == 0 {
+		return nil
+	}
+	out := make([]FindingRef, 0, len(findings))
+	for _, f := range findings {
+		out = append(out, FindingRef{
+			Kind:       string(f.Kind),
+			Identifier: f.Identifier,
+			Name:       f.Name,
+			DetailsURL: f.DetailsURL,
+		})
+	}
+	return out
+}
+
+// saveNoDiffIterationState persists the live findings/pending snapshot the
+// agent just observed when it iterated on an existing PR but produced no
+// further changes. Status and PRURL are intentionally untouched (the PR is
+// still valid and active). The trigger argument is the trigger that drove
+// this iteration (TriggerCIFailureIteration / TriggerDescriptionEditIteration
+// / TriggerMergeConflict) and is threaded through context so bot wrappers'
+// BeforeSave hooks see "agent did engage this reconcile" and refresh
+// LastIterationAt + Phase accordingly.
+//
+// Findings/pending changes alone do NOT trigger a Linear attachment write
+// (the dirty check covers Status/FailureMode/PRURL only), but the post-save
+// callback fires on every Save call so downstream mirrors capture the fresh
+// observation. Without this save, downstream consumers would see the stale
+// pre-iteration snapshot — typically empty findings from the initial-run
+// save before CI had even started — even though the framework just spent
+// minutes iterating on real CI failures.
+func (r *Reconciler[Req, Resp, CB, T, PT]) saveNoDiffIterationState(ctx context.Context, issue *linearreconciler.Issue, findings []FindingRef, pendingChecks []string, trigger string) error {
+	mgr := r.NewStateManager(issue)
+	s, _, err := mgr.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+	// Sticky-findings rule: only update when the live snapshot is non-empty,
+	// so a transient empty observation (e.g. a check that briefly cleared)
+	// doesn't clobber the prior failure record.
+	if len(findings) > 0 {
+		s.SetCurrentFindings(findings)
+	}
+	s.SetCurrentPendingChecks(pendingChecks)
+	ctx = WithActor(ctx, r.identity)
+	ctx = WithTrigger(ctx, trigger)
+	if _, err := mgr.Save(ctx, s); err != nil {
+		return fmt.Errorf("save state: %w", err)
+	}
+	return nil
+}
+
+// savePendingChecksState updates State's CurrentPendingChecks snapshot
+// for a reconcile that didn't run the agent (HasPendingChecks branch).
+// The agent didn't iterate, so PRURL/findings/status aren't refreshed —
+// just the pending list, so consumers can see what's blocking.
+//
+// The Linear write is gated by mgr.Save's existing dirty check (no-op
+// when no framework field changed), but the post-save callback fires
+// regardless so downstream mirrors stay current. Bots' BeforeSave hooks
+// see the updated pending list and can derive their own workflow phase.
+//
+// Trigger is intentionally empty: the agent didn't run, so there's no
+// History entry to attribute. Bot wrappers that key off TriggerFromContext
+// can use the empty trigger as their "agent didn't iterate this time"
+// signal.
+func (r *Reconciler[Req, Resp, CB, T, PT]) savePendingChecksState(ctx context.Context, issue *linearreconciler.Issue, pendingChecks []string) error {
+	mgr := r.NewStateManager(issue)
+	s, _, err := mgr.Load(ctx)
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
+	}
+	s.SetCurrentPendingChecks(pendingChecks)
+	// Findings are intentionally NOT cleared here — they're sticky
+	// across reconciles by design (CurrentFindings = "last observed
+	// failures", not "currently failing right now"). A reconcile that
+	// reaches HasPendingChecks just means CI is recomputing; the prior
+	// failure record remains useful as retrospective signal until a new
+	// failure replaces it or the issue terminally completes.
+	ctx = WithActor(ctx, r.identity)
 	if _, err := mgr.Save(ctx, s); err != nil {
 		return fmt.Errorf("save state: %w", err)
 	}

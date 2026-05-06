@@ -27,6 +27,14 @@ type Finding struct {
 	// Identifier is an opaque string that uniquely identifies this finding.
 	Identifier string `json:"identifier" xml:"identifier"`
 
+	// Name is a short human-readable label for the finding, suitable for
+	// rendering by downstream consumers. For CI checks it is the check
+	// run name (e.g. "Lint"). For review findings it is a path:line
+	// locator or author handle. Empty when the construction site has no
+	// natural label (callers should fall back to Identifier or render
+	// "(unnamed)" — both are valid).
+	Name string `json:"name,omitempty" xml:"name,omitempty"`
+
 	// Details contains pre-fetched information about the finding.
 	// For CI checks: name, status, conclusion, title, summary, text, detailsUrl
 	Details string `json:"details" xml:"details"`

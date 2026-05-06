@@ -393,9 +393,14 @@ func collectThreadFindings(ctx context.Context, threads gqlReviewThreadsConnecti
 			continue
 		}
 
+		threadName := thread.Path
+		if thread.Line > 0 {
+			threadName = fmt.Sprintf("%s:%d", thread.Path, thread.Line)
+		}
 		findings = append(findings, callbacks.Finding{
 			Kind:       callbacks.FindingKindReview,
 			Identifier: thread.Id,
+			Name:       threadName,
 			Details:    formatThreadDetails(thread.Path, thread.Line, thread.IsOutdated, trustedComments),
 			DetailsURL: trustedComments[0].Url,
 		})
@@ -430,6 +435,7 @@ func collectReviewBodyFindings(ctx context.Context, headRefOid string, reviews g
 		findings = append(findings, callbacks.Finding{
 			Kind:       callbacks.FindingKindReview,
 			Identifier: reviewBodyIdentifierPrefix + fmt.Sprintf("%d", review.DatabaseId),
+			Name:       "@" + review.Author.Login,
 			Details:    formatReviewBodyDetails(review),
 			DetailsURL: review.Url,
 		})
@@ -453,6 +459,7 @@ func collectFindings(
 			findings = append(findings, callbacks.Finding{
 				Kind:       callbacks.FindingKindCICheck,
 				Identifier: fmt.Sprintf("%d", run.DatabaseId),
+				Name:       run.Name,
 				Details:    formatCheckRunDetails(run.Name, run.Status, run.Conclusion, run.Title, run.Summary, run.Text, run.DetailsUrl),
 				DetailsURL: run.DetailsUrl,
 			})

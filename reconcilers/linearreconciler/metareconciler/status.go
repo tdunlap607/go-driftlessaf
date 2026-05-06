@@ -7,6 +7,8 @@ package metareconciler
 
 import (
 	"context"
+	"slices"
+	"sort"
 	"time"
 )
 
@@ -99,12 +101,46 @@ const (
 // Bots never set these themselves; on Load they're populated automatically
 // by JSON deserialization.
 type State struct {
-	IssueID     string            `json:"issue_id,omitempty"`
-	IssueURL    string            `json:"issue_url,omitempty"`
-	PRURL       string            `json:"pr_url,omitempty"`
-	Status      Status            `json:"status,omitempty"`
-	FailureMode FailureMode       `json:"failure_mode,omitempty"`
-	History     []StateTransition `json:"history,omitempty"`
+	IssueID              string            `json:"issue_id,omitempty"`
+	IssueURL             string            `json:"issue_url,omitempty"`
+	PRURL                string            `json:"pr_url,omitempty"`
+	Status               Status            `json:"status,omitempty"`
+	FailureMode          FailureMode       `json:"failure_mode,omitempty"`
+	History              []StateTransition `json:"history,omitempty"`
+	CurrentFindings      []FindingRef      `json:"current_findings,omitempty"`
+	CurrentPendingChecks []string          `json:"current_pending_checks,omitempty"`
+}
+
+// pendingChecksCap bounds the persisted CurrentPendingChecks list to
+// keep the attachment small. PRs typically have a handful of pending
+// checks at most; the cap is a defence against a misconfigured repo
+// with hundreds of check_runs flooding the snapshot. SetCurrentPendingChecks
+// sorts the input alphabetically before truncating, so the persisted
+// subset is deterministic across reconciles even if the caller-supplied
+// order shifts (changemanager appends in GitHub-return order, which can
+// vary across pagination passes).
+const pendingChecksCap = 50
+
+// FindingRef is a stable, persistence-friendly projection of a
+// changemanager finding (CI failure, code-review thread). The full
+// in-process Finding struct carries pre-fetched details that can be
+// large and volatile; FindingRef captures only what consumers need to
+// render the failure and link back to its source.
+//
+// Kind is left as a plain string (matching the underlying
+// callbacks.FindingKind values "ciCheck" and "review") rather than a
+// typed enum so consumers don't need to import the toolcall package
+// just to read State, and so future finding kinds slot in without a
+// framework change.
+type FindingRef struct {
+	Kind       string `json:"kind"`
+	Identifier string `json:"identifier"`
+	// Name is a short human-readable label suitable for rendering by
+	// downstream consumers (e.g. CI check name "Lint" or review locator
+	// "src/foo.go:42"). Empty when the upstream Finding had no Name set,
+	// in which case consumers typically fall back to Identifier.
+	Name       string `json:"name,omitempty"`
+	DetailsURL string `json:"details_url,omitempty"`
 }
 
 // SetIssueID sets the Linear issue UUID. Part of the StateMachine interface.
@@ -131,6 +167,45 @@ func (s *State) SetPRURL(u string) { s.PRURL = u }
 
 // GetFailureMode returns the current FailureMode. Part of the StateMachine interface.
 func (s *State) GetFailureMode() FailureMode { return s.FailureMode }
+
+// GetCurrentFindings returns the most recent findings snapshot. Part of
+// the StateMachine interface.
+func (s *State) GetCurrentFindings() []FindingRef { return s.CurrentFindings }
+
+// SetCurrentFindings replaces the findings snapshot wholesale. Part of
+// the StateMachine interface. Callers pass nil/empty to clear (e.g. when
+// the PR is green again). The input is cloned so later mutations by the
+// caller don't drift the persisted snapshot or the StateManager's diff
+// baseline.
+func (s *State) SetCurrentFindings(f []FindingRef) {
+	s.CurrentFindings = slices.Clone(f)
+}
+
+// GetCurrentPendingChecks returns the most recent pending-checks snapshot.
+// Part of the StateMachine interface.
+func (s *State) GetCurrentPendingChecks() []string { return s.CurrentPendingChecks }
+
+// SetCurrentPendingChecks replaces the pending-checks snapshot wholesale.
+// Part of the StateMachine interface. Callers pass nil/empty to clear.
+//
+// Sorts a clone of the input alphabetically and drops entries past
+// pendingChecksCap. Sorting makes the persisted subset deterministic
+// across reconciles (changemanager assembles the list in GitHub-return
+// order, which is not stable). Cloning prevents mutating the caller's
+// underlying array and keeps the StateManager's slice-aliased diff
+// snapshot stable.
+func (s *State) SetCurrentPendingChecks(p []string) {
+	if len(p) == 0 {
+		s.CurrentPendingChecks = nil
+		return
+	}
+	clone := slices.Clone(p)
+	sort.Strings(clone)
+	if len(clone) > pendingChecksCap {
+		clone = clone[:pendingChecksCap]
+	}
+	s.CurrentPendingChecks = clone
+}
 
 // SetFailureMode sets the FailureMode. Part of the StateMachine interface.
 func (s *State) SetFailureMode(fm FailureMode) { s.FailureMode = fm }
@@ -201,6 +276,15 @@ type StateMachine interface {
 	SetFailureMode(FailureMode)
 	AppendHistory(StateTransition)
 	GetHistory() []StateTransition
+	// GetCurrentFindings / SetCurrentFindings expose the most recent
+	// changemanager findings snapshot (CI failures + review threads).
+	// StateManager.Save persists the slice as-is; the reconcile loop
+	// refreshes it on every reconcile that produces findings, including
+	// passing nil to clear when the PR is green.
+	GetCurrentFindings() []FindingRef
+	SetCurrentFindings([]FindingRef)
+	GetCurrentPendingChecks() []string
+	SetCurrentPendingChecks([]string)
 	// SetIssueID and SetIssueURL are called by StateManager.Save before
 	// every persist, with values captured from the *Issue at
 	// NewStateManager time. Bots never call these themselves — when a

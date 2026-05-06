@@ -64,6 +64,7 @@ func (d Diagnostic) AsFinding() callbacks.Finding {
 	return callbacks.Finding{
 		Kind:       callbacks.FindingKindCICheck,
 		Identifier: id,
+		Name:       id,
 		Details:    details,
 	}
 }

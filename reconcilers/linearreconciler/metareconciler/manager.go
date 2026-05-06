@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
@@ -50,13 +51,15 @@ type SaveCallback func(ctx context.Context, linearIssueID string, stateJSON []by
 // The (changed bool, err error) return from Save lets callers gate
 // side-effects like posting a one-time bot comment on PR open.
 type StateManager[T any, PT StateConstraint[T]] struct {
-	sm                  *linearreconciler.StateManager
-	snapshotStatus      Status
-	snapshotFailureMode FailureMode
-	snapshotPRURL       string
-	loaded              bool
-	now                 func() time.Time // injectable clock for tests
-	cb                  SaveCallback
+	sm                    *linearreconciler.StateManager
+	snapshotStatus        Status
+	snapshotFailureMode   FailureMode
+	snapshotPRURL         string
+	snapshotFindings      []FindingRef
+	snapshotPendingChecks []string
+	loaded                bool
+	now                   func() time.Time // injectable clock for tests
+	cb                    SaveCallback
 
 	// Captured from the *Issue at NewStateManager time. Save calls
 	// SetIssueID/SetIssueURL on the bot's State pointer before persisting
@@ -138,6 +141,10 @@ func (m *StateManager[T, PT]) Load(ctx context.Context) (PT, bool, error) {
 	m.snapshotStatus = pt.GetStatus()
 	m.snapshotFailureMode = pt.GetFailureMode()
 	m.snapshotPRURL = pt.GetPRURL()
+	// Clone slice snapshots so the diff baseline can't drift if a bot
+	// mutates the State's slices in-place (vs. wholesale Set replacement).
+	m.snapshotFindings = slices.Clone(pt.GetCurrentFindings())
+	m.snapshotPendingChecks = slices.Clone(pt.GetCurrentPendingChecks())
 	m.loaded = loaded
 	return pt, loaded, nil
 }
@@ -163,10 +170,13 @@ func (m *StateManager[T, PT]) Load(ctx context.Context) (PT, bool, error) {
 //     wrapper-specific fields there. Returning true forces a Linear write
 //     even when no framework field changed; returning false (the default)
 //     keeps the wrapper mutation observability-only.
-//   - Same-status, same-mode, same-PRURL Save with BeforeSave returning
-//     false is a Linear-write no-op (returns false, nil). Skipping the
-//     write avoids the feedback loop where a save would trigger an
-//     attachment-update event that re-enqueues the issue immediately.
+//   - Same-status, same-mode, same-PRURL, same-findings, same-pending Save
+//     with BeforeSave returning false is a Linear-write no-op (returns
+//     false, nil). Skipping the write avoids the feedback loop where a save
+//     would trigger an attachment-update event that re-enqueues the issue
+//     immediately. Findings/pending updates DO write (so the source-of-truth
+//     attachment matches what downstream mirrors saw via the callback);
+//     same-content saves of those fields are still no-ops.
 //   - The post-save callback fires on every Save call regardless of whether
 //     Linear was written, so downstream mirrors capture wrapper-specific
 //     mutations from BeforeSave even when they don't transition the state
@@ -194,20 +204,32 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	// return true.
 	botForcedDirty := pt.BeforeSave(ctx)
 
-	// PRURL is read after BeforeSave so the diff against the snapshot uses
-	// the post-hook value. Status/FailureMode aren't re-read because
-	// BeforeSave is contracted to mutate only wrapper-specific fields.
+	// PRURL / findings / pending-checks are read after BeforeSave so the diff
+	// against the snapshot uses post-hook values. Status/FailureMode aren't
+	// re-read because BeforeSave is contracted to mutate only wrapper-
+	// specific fields.
 	currentPRURL := pt.GetPRURL()
+	currentFindings := pt.GetCurrentFindings()
+	currentPendingChecks := pt.GetCurrentPendingChecks()
 
 	statusOrModeChanged := currentStatus != m.snapshotStatus || currentFailureMode != m.snapshotFailureMode
 	prURLChanged := currentPRURL != m.snapshotPRURL
+	findingsChanged := !slices.Equal(currentFindings, m.snapshotFindings)
+	pendingChecksChanged := !slices.Equal(currentPendingChecks, m.snapshotPendingChecks)
 
 	// Persist to Linear when any tracked field changed, when the bot opted
 	// in via BeforeSave, OR when we never loaded (first save creates the
-	// attachment). PRURL-only changes save without a History append — a
-	// from==to entry would mislead observability — but the URL itself must
-	// persist so consumers see the current PR.
-	linearDirty := statusOrModeChanged || prURLChanged || botForcedDirty || !m.loaded
+	// attachment). Findings/pending-checks changes also count: the Linear
+	// attachment is the source of truth that the next reconcile's Load reads
+	// from, so a downstream-only update (post-save callback fires but Linear
+	// stays stale) would mean the next Load sees empty findings even though
+	// the framework just observed CI activity. Keeping Linear in lockstep
+	// with the post-save mirror prevents that divergence.
+	//
+	// PRURL-only and findings/pending-only changes save without a History
+	// append — a from==to entry would mislead observability — but the
+	// fields themselves must persist so consumers see current state.
+	linearDirty := statusOrModeChanged || prURLChanged || findingsChanged || pendingChecksChanged || botForcedDirty || !m.loaded
 
 	if statusOrModeChanged {
 		actor, _ := ActorFromContext(ctx)
@@ -258,10 +280,14 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	if linearDirty {
 		// Refresh the snapshot so a second Save in the same reconcile (rare,
 		// but possible) doesn't re-append the same transition or re-flag the
-		// PRURL as changed.
+		// PRURL/findings/pending as changed.
 		m.snapshotStatus = currentStatus
 		m.snapshotFailureMode = currentFailureMode
 		m.snapshotPRURL = currentPRURL
+		// Clone for the same reason as in Load — keep the diff baseline
+		// independent of any in-place mutation a bot might do later.
+		m.snapshotFindings = slices.Clone(currentFindings)
+		m.snapshotPendingChecks = slices.Clone(currentPendingChecks)
 		m.loaded = true
 	}
 
