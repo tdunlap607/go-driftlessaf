@@ -2,20 +2,30 @@
 -- and Gemini, since driftlessaf calls Claude via Vertex
 -- (public/go-driftlessaf/agents/metaagent/claude.go).
 --
--- Cost is summed over the per-call records in turns[] when present, since the
--- trace-level token columns are last-turn snapshots (RecordTokenUsage assigns
--- rather than accumulates) — using them undercounted real spend on 2026-04-27
--- by ~28x. We fall back to trace-level fields only when turns[] is empty so
--- single-call traces still get costed.
---
--- Per-turn cache token counts are not recorded in turns[]; cache discount /
--- surcharge is therefore only applied on the trace-level fallback path. This
--- contributes a sub-percent error on the sum-of-turns path.
+-- Costs are summed over the per-call records in turns[]. Each turn carries
+-- its own input / output / cache_read / cache_creation token counts, so
+-- the cache discount and surcharge apply per call rather than once at the
+-- trace level. Trace-level token fields were retired in DEV-1140 — they
+-- were last-turn snapshots from an assigning RecordTokenUsage and
+-- undercounted real spend on multi-turn traces by ~28x.
 --
 -- Tier matching is per-call (each turn classified independently against 200K)
--- which matches Anthropic and Vertex billing semantics. Sonnet 4.6 on Vertex
--- Global is uniform-priced so the tier never engages today; the logic is in
--- place for Sonnet 4.5 / Gemini 2.5 Pro / 3.x Pro traffic.
+-- which matches Anthropic and Vertex billing semantics. All four cost
+-- columns (input / output / cache_read / cache_creation) honor the Large
+-- Context tier identically — same gating predicate, same per-turn
+-- granularity. Sonnet 4.6 on Vertex Global is uniform-priced so the tier
+-- never engages today; the logic is in place for Sonnet 4.5 / Gemini 2.5
+-- Pro / 3.x Pro traffic.
+--
+-- NULL semantics: when turns[] is empty (non-LLM traces from mcptool /
+-- mcp-auth-test, or any future caller that doesn't open a turn), all
+-- *_cost_usd columns are NULL — the SUM over an empty UNNEST is NULL,
+-- not 0, and the trace-level fallback that COALESCE'd to 0 was retired
+-- in DEV-1140. Downstream consumers must IFNULL these columns when
+-- aggregating, or filter to ARRAY_LENGTH(turns) > 0 first. We could
+-- IFNULL them here instead, but NULL is the more honest signal: it
+-- distinguishes "no LLM call" from "LLM call costing $0" and forces
+-- consumers to make an explicit choice.
 --
 -- Source: https://cloud.google.com/gemini-enterprise-agent-platform/generative-ai/pricing
 WITH prices AS (
@@ -73,69 +83,80 @@ matched AS (
 )
 SELECT
   m.*,
-  -- Per-call sum when turns[] has entries; trace-level fallback otherwise.
-  -- The fallback path is the only one where cache costs apply, since per-turn
-  -- cache counts aren't recorded in turns[].
-  COALESCE(
-    (
-      SELECT SUM(
-        COALESCE(turn.input_tokens, 0) *
-          IF(turn.input_tokens > 200000 AND m.pricing_model IN (
-               'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
-             ),
-             p_large.input_price,
-             p_std.input_price)
-      )
-      FROM UNNEST(m.turns) turn
-    ),
-    COALESCE(m.input_tokens, 0) * p_std.input_price
+  -- Per-call sums over turns[]. Each turn picks its own tier based on
+  -- that call's input_tokens against the 200K threshold.
+  (
+    SELECT SUM(
+      COALESCE(turn.input_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.input_price,
+           p_std.input_price)
+    )
+    FROM UNNEST(m.turns) turn
   ) AS input_cost_usd,
-  COALESCE(
-    (
-      SELECT SUM(
-        COALESCE(turn.output_tokens, 0) *
-          IF(turn.input_tokens > 200000 AND m.pricing_model IN (
-               'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
-             ),
-             p_large.output_price,
-             p_std.output_price)
-      )
-      FROM UNNEST(m.turns) turn
-    ),
-    COALESCE(m.output_tokens, 0) * p_std.output_price
+  (
+    SELECT SUM(
+      COALESCE(turn.output_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.output_price,
+           p_std.output_price)
+    )
+    FROM UNNEST(m.turns) turn
   ) AS output_cost_usd,
-  IF(ARRAY_LENGTH(m.turns) = 0,
-     COALESCE(m.cache_read_tokens, 0) * p_std.cache_read_price,
-     0.0) AS cache_read_cost_usd,
-  IF(ARRAY_LENGTH(m.turns) = 0,
-     COALESCE(m.cache_creation_tokens, 0) * p_std.cache_creation_price,
-     0.0) AS cache_creation_cost_usd,
-  -- Source of the cost figure: 'turns' (per-call sum) or 'trace_fallback'
-  -- (trace-level snapshot used because turns[] is empty). Lets dashboards
-  -- distinguish complete from approximate rows.
-  IF(ARRAY_LENGTH(m.turns) > 0, 'turns', 'trace_fallback') AS cost_source,
-  COALESCE(
-    (
-      SELECT SUM(
-        COALESCE(turn.input_tokens, 0) *
-          IF(turn.input_tokens > 200000 AND m.pricing_model IN (
-               'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
-             ),
-             p_large.input_price,
-             p_std.input_price)
-        + COALESCE(turn.output_tokens, 0) *
-          IF(turn.input_tokens > 200000 AND m.pricing_model IN (
-               'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
-             ),
-             p_large.output_price,
-             p_std.output_price)
-      )
-      FROM UNNEST(m.turns) turn
-    ),
-    COALESCE(m.input_tokens, 0)          * p_std.input_price
-      + COALESCE(m.output_tokens, 0)         * p_std.output_price
-      + COALESCE(m.cache_read_tokens, 0)     * p_std.cache_read_price
-      + COALESCE(m.cache_creation_tokens, 0) * p_std.cache_creation_price
+  (
+    SELECT SUM(
+      COALESCE(turn.cache_read_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.cache_read_price,
+           p_std.cache_read_price)
+    )
+    FROM UNNEST(m.turns) turn
+  ) AS cache_read_cost_usd,
+  (
+    SELECT SUM(
+      COALESCE(turn.cache_creation_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.cache_creation_price,
+           p_std.cache_creation_price)
+    )
+    FROM UNNEST(m.turns) turn
+  ) AS cache_creation_cost_usd,
+  (
+    SELECT SUM(
+      COALESCE(turn.input_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.input_price,
+           p_std.input_price)
+      + COALESCE(turn.output_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.output_price,
+           p_std.output_price)
+      + COALESCE(turn.cache_read_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.cache_read_price,
+           p_std.cache_read_price)
+      + COALESCE(turn.cache_creation_tokens, 0) *
+        IF(turn.input_tokens > 200000 AND m.pricing_model IN (
+             'claude-sonnet-4-5','gemini-2.5-pro','gemini-3-pro-preview','gemini-3.1-pro-preview'
+           ),
+           p_large.cache_creation_price,
+           p_std.cache_creation_price)
+    )
+    FROM UNNEST(m.turns) turn
   ) AS total_cost_usd
 FROM matched m
 LEFT JOIN prices p_std

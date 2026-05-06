@@ -210,7 +210,6 @@ func (e *executor[Request, Response]) Execute(
 
 		if completion.Usage.PromptTokens > 0 || completion.Usage.CompletionTokens > 0 {
 			e.recordTokenMetrics(ctx, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
-			trace.RecordTokenUsage(e.modelName, completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 			llmTurn.RecordTokens(completion.Usage.PromptTokens, completion.Usage.CompletionTokens)
 		}
 

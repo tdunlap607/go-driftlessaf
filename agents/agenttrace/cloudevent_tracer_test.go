@@ -102,7 +102,9 @@ func TestWithCloudEventEmission_EmitsCloudEvent(t *testing.T) {
 	tc := trace.StartToolCall("tc1", "update_title", map[string]any{"title": "feat: new"})
 	tc.Complete("done", nil)
 
-	trace.RecordTokenUsage("gemini-2.5-flash", 1500, 300)
+	turn := trace.BeginTurn(0, "google.vertex", "gemini-2.5-flash")
+	turn.RecordTokens(1500, 300)
+	turn.End()
 	done("fixed", nil)
 	drainCE[string](wrapped)
 
@@ -129,11 +131,9 @@ func TestWithCloudEventEmission_EmitsCloudEvent(t *testing.T) {
 	}
 
 	want := map[string]any{
-		"input_prompt":  "fix the title",
-		"result":        "fixed",
-		"model":         "gemini-2.5-flash",
-		"input_tokens":  float64(1500),
-		"output_tokens": float64(300),
+		"input_prompt": "fix the title",
+		"result":       "fixed",
+		"model":        "gemini-2.5-flash",
 		"exec_context": map[string]any{
 			"reconciler_key":  "pr:owner/repo/42",
 			"reconciler_type": "pr",
@@ -145,6 +145,16 @@ func TestWithCloudEventEmission_EmitsCloudEvent(t *testing.T) {
 				"name":   "update_title",
 				"params": map[string]any{"title": "feat: new"},
 				"result": "done",
+			},
+		},
+		"turns": []any{
+			map[string]any{
+				"index":         float64(0),
+				"model":         "gemini-2.5-flash",
+				"system":        "google.vertex",
+				"input_tokens":  float64(1500),
+				"output_tokens": float64(300),
+				"failed":        false,
 			},
 		},
 	}

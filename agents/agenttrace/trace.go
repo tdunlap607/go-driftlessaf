@@ -107,13 +107,15 @@ type LLMTurn[T any] struct {
 // CloudEvent payload). Token counts reflect a single turn rather than
 // cumulative totals on the parent Trace.
 type RecordedTurn struct {
-	Index        int       `json:"index"`
-	Model        string    `json:"model,omitempty"`
-	System       string    `json:"system,omitempty"`
-	InputTokens  int64     `json:"input_tokens,omitempty"`
-	OutputTokens int64     `json:"output_tokens,omitempty"`
-	StartTime    time.Time `json:"start_time"`
-	EndTime      time.Time `json:"end_time"`
+	Index               int       `json:"index"`
+	Model               string    `json:"model,omitempty"`
+	System              string    `json:"system,omitempty"`
+	InputTokens         int64     `json:"input_tokens,omitempty"`
+	OutputTokens        int64     `json:"output_tokens,omitempty"`
+	CacheReadTokens     int64     `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int64     `json:"cache_creation_tokens,omitempty"`
+	StartTime           time.Time `json:"start_time"`
+	EndTime             time.Time `json:"end_time"`
 	// Errors is the chronological list of errors the turn encountered, including
 	// transients that the turn recovered from. A non-empty list does NOT mean
 	// the turn failed — see Failed for the terminal outcome. Populated via
@@ -159,12 +161,13 @@ type Trace[T any] struct {
 	// can query by service — the recorder records only event.Data().
 	Source string `json:"source,omitempty"`
 
-	// Token usage fields, populated by RecordTokenUsage / RecordCacheTokenUsage.
-	Model               string `json:"model,omitempty"`
-	InputTokens         int64  `json:"input_tokens,omitempty"`
-	OutputTokens        int64  `json:"output_tokens,omitempty"`
-	CacheReadTokens     int64  `json:"cache_read_tokens,omitempty"`
-	CacheCreationTokens int64  `json:"cache_creation_tokens,omitempty"`
+	// Model identifies the LLM the executor drove this trace against
+	// (e.g. "claude-sonnet-4-6", "gemini-2.5-pro"). Populated lazily by
+	// BeginTurn from the first turn's model — assumes a single-model
+	// trace, which matches every executor in the codebase. Per-turn
+	// model lives on Turns[i].Model so multi-model traces can still be
+	// reasoned about turn-by-turn.
+	Model string `json:"model,omitempty"`
 
 	// mu protects mutable fields during the build-up phase (concurrent
 	// tool calls). After Complete the trace is immutable.
@@ -297,6 +300,14 @@ func truncatePayload(s string) (string, bool) {
 // system is the OTel GenAI provider identifier: "openai", "anthropic",
 // "google.vertex", etc. It powers provider filtering in eval tools.
 //
+// Per-call token usage (input/output and prompt cache) is recorded by
+// LLMTurn.RecordTokens / LLMTurn.RecordCacheTokens — replacing the old
+// trace-level RecordTokenUsage / RecordCacheTokenUsage methods removed
+// in DEV-1140. Per OTel GenAI semconv, gen_ai.usage.* attributes belong
+// on the per-call "chat <model>" span, not the orchestration invoke_agent
+// span. Trace-level token totals are derived from turns[] in downstream
+// consumers (see agent_trace_costs.sql).
+//
 // Callers MUST call End() on the current turn before calling BeginTurn again.
 // Overlapping turns corrupt the span hierarchy: the later End() restores a
 // stale context, causing subsequent spans to be parented incorrectly.
@@ -322,6 +333,15 @@ func (t *Trace[T]) BeginTurn(turn int, system, modelName string) *LLMTurn[T] {
 
 	t.mu.Lock()
 	t.ctx = newCtx
+	// Latch the trace-level model from the first turn that names one. The
+	// root span name follows OTel GenAI semconv "{operation} {model}" — the
+	// model isn't known when the trace starts, so we set it here.
+	if t.Model == "" && modelName != "" {
+		t.Model = modelName
+		if t.span != nil {
+			t.span.SetName("invoke_agent " + modelName)
+		}
+	}
 	t.mu.Unlock()
 
 	return &LLMTurn[T]{
@@ -347,6 +367,23 @@ func (lt *LLMTurn[T]) RecordTokens(inputTokens, outputTokens int64) {
 	}
 	lt.record.InputTokens = inputTokens
 	lt.record.OutputTokens = outputTokens
+}
+
+// RecordCacheTokens sets prompt cache token counts as span attributes on the
+// turn span and on the per-turn record. The OTel GenAI semconv attributes
+// (gen_ai.usage.cache_read_input_tokens, gen_ai.usage.cache_creation_input_tokens)
+// belong on the per-call chat span, not the orchestration span. Per-turn
+// cache counts let downstream cost analysis apply the cache discount /
+// surcharge accurately on a per-call basis.
+func (lt *LLMTurn[T]) RecordCacheTokens(cacheReadTokens, cacheCreationTokens int64) {
+	if lt.span != nil {
+		lt.span.SetAttributes(
+			attribute.Int64("gen_ai.usage.cache_read_input_tokens", cacheReadTokens),
+			attribute.Int64("gen_ai.usage.cache_creation_input_tokens", cacheCreationTokens),
+		)
+	}
+	lt.record.CacheReadTokens = cacheReadTokens
+	lt.record.CacheCreationTokens = cacheCreationTokens
 }
 
 // RecordError appends err to the turn's chronological error list and emits
@@ -462,68 +499,6 @@ func (t *Trace[T]) StartToolCall(id, name string, params map[string]any) *ToolCa
 		trace:     t,
 		ctx:       ctx,
 		span:      span,
-	}
-}
-
-// RecordTokenUsage records model and token usage as span attributes for observability.
-// This allows viewing token consumption directly in Cloud Trace without needing to
-// cross-reference with metrics.
-//
-// Token counts are emitted on the root invoke_agent span via OpenTelemetry GenAI
-// semantic conventions (gen_ai.usage.input_tokens / gen_ai.usage.output_tokens)
-// alongside legacy custom attributes. gen_ai.request.model is NOT emitted on the
-// root span — per OTel GenAI semconv it's a turn-level concern, emitted on the
-// "chat <model>" spans in BeginTurn. Langfuse reclassifies any root span carrying
-// gen_ai.request.model as a "generation" observation, which is wrong for an
-// orchestration span; Braintrust doesn't reclassify but semantically agrees.
-// See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
-func (t *Trace[T]) RecordTokenUsage(model string, inputTokens, outputTokens int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.Model = model
-	t.InputTokens = inputTokens
-	t.OutputTokens = outputTokens
-
-	if t.span != nil {
-		// Update span name to follow semconv format: "{operation} {model}"
-		t.span.SetName("invoke_agent " + model)
-		t.span.SetAttributes(
-			// Custom attributes (existing)
-			attribute.String("model", model),
-			attribute.Int64("tokens.input", inputTokens),
-			attribute.Int64("tokens.output", outputTokens),
-			attribute.Int64("tokens.total", inputTokens+outputTokens),
-			// OpenTelemetry GenAI semantic conventions (token usage only —
-			// model is a turn-level concern, emitted in BeginTurn)
-			attribute.Int64("gen_ai.usage.input_tokens", inputTokens),
-			attribute.Int64("gen_ai.usage.output_tokens", outputTokens),
-		)
-	}
-}
-
-// RecordCacheTokenUsage records Anthropic prompt cache token metrics as span
-// attributes using OpenTelemetry GenAI semantic conventions. These appear
-// alongside gen_ai.usage.input_tokens and gen_ai.usage.output_tokens in Cloud
-// Trace, enabling per-request visibility into how much of the input was served
-// from cache vs fresh.
-// See: https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-spans/
-func (t *Trace[T]) RecordCacheTokenUsage(cacheReadTokens, cacheCreationTokens int64) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-
-	t.CacheReadTokens = cacheReadTokens
-	t.CacheCreationTokens = cacheCreationTokens
-
-	if t.span != nil {
-		t.span.SetAttributes(
-			// Custom attributes
-			attribute.Int64("tokens.cache_read", cacheReadTokens),
-			attribute.Int64("tokens.cache_creation", cacheCreationTokens),
-			// OpenTelemetry GenAI semantic conventions
-			attribute.Int64("gen_ai.usage.cache_read_input_tokens", cacheReadTokens),
-			attribute.Int64("gen_ai.usage.cache_creation_input_tokens", cacheCreationTokens),
-		)
 	}
 }
 
@@ -785,45 +760,37 @@ func (t *Trace[T]) MarshalJSON() ([]byte, error) {
 	}
 
 	return json.Marshal(struct {
-		ID                  string             `json:"id"`
-		OTelTraceID         string             `json:"otel_trace_id,omitempty"`
-		InputPrompt         string             `json:"input_prompt"`
-		ExecContext         ExecutionContext   `json:"exec_context,omitempty"`
-		ToolCalls           []jsonToolCall     `json:"tool_calls"`
-		Turns               []RecordedTurn     `json:"turns,omitempty"`
-		Reasoning           []ReasoningContent `json:"reasoning,omitempty"`
-		Result              T                  `json:"result"`
-		Error               string             `json:"error,omitempty"`
-		StartTime           time.Time          `json:"start_time"`
-		EndTime             time.Time          `json:"end_time"`
-		Metadata            map[string]any     `json:"metadata,omitempty"`
-		AgentName           string             `json:"agent_name,omitempty"`
-		Source              string             `json:"source,omitempty"`
-		Model               string             `json:"model,omitempty"`
-		InputTokens         int64              `json:"input_tokens,omitempty"`
-		OutputTokens        int64              `json:"output_tokens,omitempty"`
-		CacheReadTokens     int64              `json:"cache_read_tokens,omitempty"`
-		CacheCreationTokens int64              `json:"cache_creation_tokens,omitempty"`
+		ID          string             `json:"id"`
+		OTelTraceID string             `json:"otel_trace_id,omitempty"`
+		InputPrompt string             `json:"input_prompt"`
+		ExecContext ExecutionContext   `json:"exec_context,omitempty"`
+		ToolCalls   []jsonToolCall     `json:"tool_calls"`
+		Turns       []RecordedTurn     `json:"turns,omitempty"`
+		Reasoning   []ReasoningContent `json:"reasoning,omitempty"`
+		Result      T                  `json:"result"`
+		Error       string             `json:"error,omitempty"`
+		StartTime   time.Time          `json:"start_time"`
+		EndTime     time.Time          `json:"end_time"`
+		Metadata    map[string]any     `json:"metadata,omitempty"`
+		AgentName   string             `json:"agent_name,omitempty"`
+		Source      string             `json:"source,omitempty"`
+		Model       string             `json:"model,omitempty"`
 	}{
-		ID:                  t.ID,
-		OTelTraceID:         t.OTelTraceID,
-		InputPrompt:         t.InputPrompt,
-		ExecContext:         t.ExecContext,
-		ToolCalls:           toolCalls,
-		Turns:               t.Turns,
-		Reasoning:           t.Reasoning,
-		Result:              t.Result,
-		Error:               errStr,
-		StartTime:           t.StartTime,
-		EndTime:             t.EndTime,
-		Metadata:            t.Metadata,
-		AgentName:           t.AgentName,
-		Source:              t.Source,
-		Model:               t.Model,
-		InputTokens:         t.InputTokens,
-		OutputTokens:        t.OutputTokens,
-		CacheReadTokens:     t.CacheReadTokens,
-		CacheCreationTokens: t.CacheCreationTokens,
+		ID:          t.ID,
+		OTelTraceID: t.OTelTraceID,
+		InputPrompt: t.InputPrompt,
+		ExecContext: t.ExecContext,
+		ToolCalls:   toolCalls,
+		Turns:       t.Turns,
+		Reasoning:   t.Reasoning,
+		Result:      t.Result,
+		Error:       errStr,
+		StartTime:   t.StartTime,
+		EndTime:     t.EndTime,
+		Metadata:    t.Metadata,
+		AgentName:   t.AgentName,
+		Source:      t.Source,
+		Model:       t.Model,
 	})
 }
 

@@ -81,10 +81,10 @@ func setupRecorder(t *testing.T) *tracetest.SpanRecorder {
 }
 
 // driveAgentTrace creates a root invoke_agent span, opens one turn with the
-// given system + model, records token usage, and completes the trace with
-// the supplied result. It mirrors the minimum surface an executor exercises.
-// Callers that want payload emission on the root span pass a ctx wrapped
-// with WithPayloadsEnabled; the default ctx leaves payloads off.
+// given system + model, records token usage on the turn, and completes the
+// trace with the supplied result. It mirrors the minimum surface an executor
+// exercises. Callers that want payload emission on the root span pass a ctx
+// wrapped with WithPayloadsEnabled; the default ctx leaves payloads off.
 func driveAgentTrace[T any](t *testing.T, ctx context.Context, spanName, system, model string, result T, opts ...StartTraceOption) {
 	t.Helper()
 	ctx = WithExecutionContext(ctx, ExecutionContext{
@@ -94,18 +94,21 @@ func driveAgentTrace[T any](t *testing.T, ctx context.Context, spanName, system,
 	trace, done := StartTrace[T](ctx, spanName, opts...)
 	turn := trace.BeginTurn(0, system, model)
 	turn.RecordTokens(1000, 200)
-	trace.RecordTokenUsage(model, 1000, 200)
 	turn.End()
 	done(result, nil)
 }
 
 // TestPayloadsEnabled verifies that when WithPayloadsEnabled(ctx, true) is
 // set, the root invoke_agent span carries both the Langfuse-compatible and
-// Braintrust / OTel-semconv-compatible payload attribute pairs, the agent
-// name and dynamic name labels, and token usage; and that the turn span
-// carries gen_ai.system alongside gen_ai.request.model. It also asserts
-// that gen_ai.request.model is NOT emitted on the root span — the absence
-// falls out of the whole-map comparison for free.
+// Braintrust / OTel-semconv-compatible payload attribute pairs and the
+// agent name / dynamic name labels; and that the turn span carries
+// gen_ai.system alongside gen_ai.request.model + per-call token usage.
+// gen_ai.usage.* token attrs and tokens.* / model custom attrs MUST NOT
+// appear on the root span — per OTel GenAI semconv they belong on the
+// per-call "chat <model>" span, not the orchestration invoke_agent span.
+// Langfuse otherwise reclassifies the root span as a generation observation
+// and double-counts cost. The absence falls out of the whole-map comparison
+// for free.
 func TestPayloadsEnabled(t *testing.T) {
 	sr := setupRecorder(t)
 
@@ -132,12 +135,6 @@ func TestPayloadsEnabled(t *testing.T) {
 		"gen_ai.input.messages":           present{},
 		"gen_ai.completion":               present{},
 		"gen_ai.output.messages":          present{},
-		"model":                           "gemini-2.5-flash",
-		"tokens.input":                    int64(1000),
-		"tokens.output":                   int64(200),
-		"tokens.total":                    int64(1200),
-		"gen_ai.usage.input_tokens":       int64(1000),
-		"gen_ai.usage.output_tokens":      int64(200),
 	}
 	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
 		t.Errorf("root attrs (-want +got):\n%s", diff)
@@ -161,11 +158,11 @@ func TestPayloadsEnabled(t *testing.T) {
 }
 
 // TestPayloadsDisabled verifies that with no WithPayloadsEnabled opt-in on
-// the ctx, the root span has no prompt/completion payload attributes but
-// still carries token usage, agent name, Braintrust name, and — on the
-// turn span — gen_ai.system and gen_ai.request.model. The absence of
-// the four payload keys falls out of the whole-map comparison (any extra
-// key in the got map would cause the diff to fail).
+// the ctx, the root span has no prompt/completion payload attributes,
+// only the agent name and Braintrust name. As in TestPayloadsEnabled,
+// no token usage attrs land on the root — token usage is per-call and
+// belongs on the turn span. Absence of the payload keys and the token
+// attrs falls out of the whole-map comparison.
 func TestPayloadsDisabled(t *testing.T) {
 	sr := setupRecorder(t)
 
@@ -188,12 +185,6 @@ func TestPayloadsDisabled(t *testing.T) {
 		"braintrust.span_attributes.name": "autofix: pr:chainguard-dev/mono/38632",
 		"reconciler_key":                  "pr:chainguard-dev/mono/38632",
 		"reconciler_type":                 "pr",
-		"model":                           "gemini-2.5-flash",
-		"tokens.input":                    int64(1000),
-		"tokens.output":                   int64(200),
-		"tokens.total":                    int64(1200),
-		"gen_ai.usage.input_tokens":       int64(1000),
-		"gen_ai.usage.output_tokens":      int64(200),
 	}
 	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
 		t.Errorf("root attrs (-want +got):\n%s", diff)
@@ -292,8 +283,11 @@ func TestDefaultAgentNameFromContext(t *testing.T) {
 	turn.End()
 	done(map[string]any{}, nil)
 
+	// BeginTurn renames the root span to "invoke_agent <model>" the first
+	// time a turn is opened — that follows OTel GenAI semconv "{operation}
+	// {model}" without forcing every caller to pass a model up front.
 	spans := sr.Ended()
-	root := findSpan(spans, "invoke_agent")
+	root := findSpan(spans, "invoke_agent claude-haiku-4-5")
 	if root == nil {
 		t.Fatalf("root invoke_agent span not found; got %d spans", len(spans))
 	}

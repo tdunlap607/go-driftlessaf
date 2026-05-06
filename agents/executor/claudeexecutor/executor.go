@@ -389,10 +389,11 @@ func (e *executor[Request, Response]) Execute(
 			return response, true, fmt.Errorf("failed to stream Claude response: %w", err)
 		}
 
-		// Record token usage in metrics and trace span
+		// Record token usage in metrics and on the per-turn span. Trace-level
+		// token totals are derived from turns[] in downstream consumers — see
+		// agent_trace_costs.sql.
 		if message.Usage.InputTokens > 0 || message.Usage.OutputTokens > 0 {
 			e.recordTokenMetrics(ctx, message.Usage.InputTokens, message.Usage.OutputTokens)
-			trace.RecordTokenUsage(e.modelName, message.Usage.InputTokens, message.Usage.OutputTokens)
 			llmTurn.RecordTokens(message.Usage.InputTokens, message.Usage.OutputTokens)
 		}
 
@@ -400,13 +401,14 @@ func (e *executor[Request, Response]) Execute(
 		// token counts alongside the regular input/output tokens:
 		//   - cache_read_input_tokens:     tokens served from cache (cheap, 0.1x price)
 		//   - cache_creation_input_tokens: tokens written to cache (1.25x price, amortized over reads)
-		// These are recorded as OTel counters and trace span attributes for cost analysis.
+		// These are recorded as OTel counters and on the per-turn span so the
+		// cost view can apply per-call cache pricing accurately.
 		if e.cacheControl {
 			cacheRead := message.Usage.CacheReadInputTokens
 			cacheCreation := message.Usage.CacheCreationInputTokens
 			if cacheRead > 0 || cacheCreation > 0 {
 				e.recordCacheMetrics(ctx, cacheRead, cacheCreation)
-				trace.RecordCacheTokenUsage(cacheRead, cacheCreation)
+				llmTurn.RecordCacheTokens(cacheRead, cacheCreation)
 				clog.DebugContext(ctx, "Prompt cache metrics",
 					"cache_read_tokens", cacheRead,
 					"cache_creation_tokens", cacheCreation)

@@ -327,9 +327,7 @@ func (e *executor[Request, Response]) Execute(
 	}
 
 	if response != nil && response.UsageMetadata != nil {
-		e.recordTokenMetrics(ctx, trace, response.UsageMetadata)
-		// Also record on trace span for easy viewing in Cloud Trace
-		trace.RecordTokenUsage(e.model, int64(response.UsageMetadata.PromptTokenCount), int64(response.UsageMetadata.CandidatesTokenCount))
+		e.recordTokenMetrics(ctx, response.UsageMetadata)
 	}
 
 	// Handle the conversation loop with bounded turns to prevent runaway executions.
@@ -369,6 +367,15 @@ func (e *executor[Request, Response]) Execute(
 				int64(response.UsageMetadata.PromptTokenCount),
 				int64(response.UsageMetadata.CandidatesTokenCount),
 			)
+			// Vertex reports cache hits via CachedContentTokenCount; cache
+			// writes are not separately billed for Gemini (see cost view),
+			// so CacheCreationTokens stays 0 here. A future "cache write
+			// events" metric would have to source from getOrCreateCache
+			// (the only place a Gemini cache create actually happens) —
+			// turns[] sees only the read-side hits.
+			if e.cacheControl && response.UsageMetadata.CachedContentTokenCount > 0 {
+				llmTurn.RecordCacheTokens(int64(response.UsageMetadata.CachedContentTokenCount), 0)
+			}
 		}
 
 		clog.InfoContext(ctx, "Received response from model", "candidates_count", len(response.Candidates))
@@ -403,11 +410,10 @@ func (e *executor[Request, Response]) Execute(
 				return zero, nil, true, fmt.Errorf("failed to send retry message after malformed function call: %w", err)
 			}
 
-			// Record metrics for retry call
+			// Record metrics for retry call. Per-turn token recording for
+			// retryResp happens at the top of the next executeTurn iteration.
 			if retryResp != nil && retryResp.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, trace, retryResp.UsageMetadata)
-				// Also record on trace span for easy viewing in Cloud Trace
-				trace.RecordTokenUsage(e.model, int64(retryResp.UsageMetadata.PromptTokenCount), int64(retryResp.UsageMetadata.CandidatesTokenCount))
+				e.recordTokenMetrics(ctx, retryResp.UsageMetadata)
 			}
 
 			// Continue with the new response
@@ -505,9 +511,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			if nextResponse != nil && nextResponse.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, trace, nextResponse.UsageMetadata)
-				// Also record on trace span for easy viewing in Cloud Trace
-				trace.RecordTokenUsage(e.model, int64(nextResponse.UsageMetadata.PromptTokenCount), int64(nextResponse.UsageMetadata.CandidatesTokenCount))
+				e.recordTokenMetrics(ctx, nextResponse.UsageMetadata)
 			}
 			return zero, nextResponse, false, nil
 		}
@@ -533,8 +537,7 @@ func (e *executor[Request, Response]) Execute(
 			}
 
 			if redirectResp != nil && redirectResp.UsageMetadata != nil {
-				e.recordTokenMetrics(ctx, trace, redirectResp.UsageMetadata)
-				trace.RecordTokenUsage(e.model, int64(redirectResp.UsageMetadata.PromptTokenCount), int64(redirectResp.UsageMetadata.CandidatesTokenCount))
+				e.recordTokenMetrics(ctx, redirectResp.UsageMetadata)
 			}
 
 			return zero, redirectResp, false, nil
@@ -574,6 +577,22 @@ func (e *executor[Request, Response]) Execute(
 
 	clog.ErrorContext(ctx, "Agent exceeded maximum conversation turns", "max_turns", e.maxTurns)
 	e.recordTurns(ctx, e.maxTurns, true)
+	// The final unprocessed response carries real billable tokens (the
+	// model already generated them). Without this synthetic turn the
+	// loop would exit and only OTel metrics would see them — turns[]
+	// is the source of truth for cost analysis (DEV-1140), so leaving
+	// them off would silently undercount maxTurns-exhausted runs.
+	if response != nil && response.UsageMetadata != nil {
+		llmTurn := trace.BeginTurn(e.maxTurns, agenttrace.SystemGoogleVertex, e.model)
+		llmTurn.RecordTokens(
+			int64(response.UsageMetadata.PromptTokenCount),
+			int64(response.UsageMetadata.CandidatesTokenCount),
+		)
+		if e.cacheControl && response.UsageMetadata.CachedContentTokenCount > 0 {
+			llmTurn.RecordCacheTokens(int64(response.UsageMetadata.CachedContentTokenCount), 0)
+		}
+		llmTurn.End()
+	}
 	return resp, fmt.Errorf("agent exceeded maximum conversation turns (%d)", e.maxTurns)
 }
 
@@ -645,8 +664,10 @@ func (e *executor[Request, Response]) resourceLabelsToAttributes() []attribute.K
 
 // recordTokenMetrics records token usage with optional enrichment.
 // When context caching is active and the response includes cached tokens,
-// cache metrics are also recorded.
-func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, trace *agenttrace.Trace[Response], usage *genai.GenerateContentResponseUsageMetadata) {
+// OTel cache metrics are also recorded. Per-turn cache token attribution
+// onto the trace happens in executeTurn (LLMTurn.RecordCacheTokens) — this
+// path only emits the OTel metrics counter.
+func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, usage *genai.GenerateContentResponseUsageMetadata) {
 	if usage == nil {
 		return
 	}
@@ -655,10 +676,8 @@ func (e *executor[Request, Response]) recordTokenMetrics(ctx context.Context, tr
 	attrs = append(attrs, attribute.String("gen_ai.provider.name", "gcp.vertex_ai"))
 	e.genaiMetrics.RecordTokens(ctx, e.model, int64(usage.PromptTokenCount), int64(usage.CandidatesTokenCount), attrs...)
 
-	// Record context cache metrics if caching is active.
 	if e.cacheControl && usage.CachedContentTokenCount > 0 {
 		e.recordCacheMetrics(ctx, int64(usage.CachedContentTokenCount), 0)
-		trace.RecordCacheTokenUsage(int64(usage.CachedContentTokenCount), 0)
 		clog.DebugContext(ctx, "Prompt cache metrics",
 			"cache_read_tokens", usage.CachedContentTokenCount)
 	}

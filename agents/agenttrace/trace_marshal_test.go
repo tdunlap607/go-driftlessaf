@@ -55,7 +55,7 @@ func TestTraceMarshalJSON(t *testing.T) {
 		want   map[string]any // full expected value (dynamic keys ignored by cmp)
 		absent []string       // keys that must NOT appear
 	}{{
-		name: "basic fields and token usage",
+		name: "basic fields and per-turn token usage",
 		setup: func(t *testing.T) *Trace[string] {
 			tracer := &mockTracer[string]{traces: &[]*Trace[string]{}}
 			ctx := WithExecutionContext(t.Context(), ExecutionContext{
@@ -64,24 +64,38 @@ func TestTraceMarshalJSON(t *testing.T) {
 				CommitSHA:      "abc123",
 			})
 			trace := tracer.NewTrace(ctx, "test prompt")
-			trace.RecordTokenUsage("gemini-2.5-flash", 1500, 300)
+			turn := trace.BeginTurn(0, "google.vertex", "gemini-2.5-flash")
+			turn.RecordTokens(1500, 300)
+			turn.End()
 			trace.complete("the result", nil)
 			return trace
 		},
+		// Trace.Model is latched from the first turn's model so single-call
+		// traces still expose the model at the trace level for queries like
+		// "cost by model". Token totals live only in turns[].
 		want: map[string]any{
-			"input_prompt":  "test prompt",
-			"result":        "the result",
-			"model":         "gemini-2.5-flash",
-			"input_tokens":  float64(1500),
-			"output_tokens": float64(300),
-			"tool_calls":    []any{},
+			"input_prompt": "test prompt",
+			"result":       "the result",
+			"model":        "gemini-2.5-flash",
+			"tool_calls":   []any{},
+			"turns": []any{
+				map[string]any{
+					"index":         float64(0),
+					"model":         "gemini-2.5-flash",
+					"system":        "google.vertex",
+					"input_tokens":  float64(1500),
+					"output_tokens": float64(300),
+					"failed":        false,
+				},
+			},
 			"exec_context": map[string]any{
 				"reconciler_key":  "pr:owner/repo/42",
 				"reconciler_type": "pr",
 				"commit_sha":      "abc123",
 			},
 		},
-		absent: []string{"error"},
+		// Trace-level token fields were dropped — turns[] is the source of truth.
+		absent: []string{"error", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"},
 	}, {
 		name: "error serializes as string",
 		setup: func(t *testing.T) *Trace[string] {
@@ -204,6 +218,7 @@ func TestTraceMarshalJSON(t *testing.T) {
 			"exec_context": map[string]any{},
 			"agent_name":   "materializer",
 			"source":       "octo-identity",
+			"model":        "gemini-2.5-flash",
 			"turns": []any{
 				map[string]any{
 					"index":         float64(0),
@@ -242,6 +257,9 @@ func TestTraceMarshalJSON(t *testing.T) {
 			"result":       "done",
 			"tool_calls":   []any{},
 			"exec_context": map[string]any{},
+			// Trace.Model is latched from the first turn; per-turn models still
+			// vary in turns[] when an executor switches mid-trace.
+			"model": "model-a",
 			"turns": []any{
 				map[string]any{
 					"index":         float64(0),
