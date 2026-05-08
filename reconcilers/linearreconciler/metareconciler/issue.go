@@ -51,47 +51,68 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		return nil
 	}
 
-	if issue.State.Type == StateTypeCompleted || issue.State.Type == StateTypeCanceled {
-		clog.InfoContext(ctx, "Issue is closed, skipping")
-		return nil
-	}
-
-	// State-based gates: handle two failure modes that were terminal at the
-	// time they were recorded, but whose semantics depend on whether the
-	// human has since reactivated the Linear issue (which we already
-	// confirmed above is non-terminal).
+	// Single-Load gate stage: mirror the live Linear workflow-state into
+	// State for downstream observability AND apply the bot-auto-cancel
+	// reactivation reset, with a single Save if anything changed. Order
+	// matters: this MUST run before the cancel-gate below so closed-issue
+	// reconciles (which return nil from the cancel-gate without further
+	// saves) still propagate the human's workflow-state flip to downstream
+	// mirrors.
 	//
-	//   - FailureModePRClosed: a bot SaveCallback that observed a closed
-	//     PR transitioned the issue here (and may have used
-	//     SetIssueStateByType to canceled the Linear issue too). The human
-	//     moving Linear back off canceled is an explicit "keep going"
-	//     signal, so reset the terminal markers + drop the stale PRURL/
-	//     findings/pending so the next reconcile cycle re-engages with a
-	//     fresh PR. Without this, downstream consumers reading State
-	//     would render the issue as terminally cancelled indefinitely
-	//     even though the human's intent is the opposite.
-	//
-	//   - FailureModeNoDiff / FailureModeNoProgress: bot decided no work
-	//     was possible (initial-run no-diff or K-iteration no-progress).
-	//     These don't auto-cancel Linear, so the human reactivating
-	//     doesn't tell us anything new — re-running would just reproduce
-	//     the same no-op. Operators clear State manually to retry, same
-	//     escape hatch the framework already documents.
+	// Gate helpers are mutate-only — the Save fires once at the end of the
+	// block with a single trigger (reactivation reset wins over linear-
+	// state sync because the History entry should record the more
+	// significant transition). Helpers are extracted so their predicates
+	// are unit-testable without scaffolding a full reconcileIssue mock
+	// chain.
 	gateMgr := r.NewStateManager(issue)
 	existing, loaded, gateLoadErr := gateMgr.Load(ctx)
-	// if-else chain (rather than switch) is deliberate: existing/loaded need
-	// function scope so the findings-delta dedup at the HasFindings branch
-	// below can reference them. A switch would scope them to the switch.
-	//nolint:gocritic // ifElseChain: see comment above
 	if gateLoadErr != nil {
 		// Don't fail-closed on transient Load errors — fall through and
 		// let the rest of reconcile run, where state mutations have their
 		// own retry behaviour.
 		clog.WarnContext(ctx, "Skipping state-based gates: load failed", "error", gateLoadErr)
-	} else if loaded && r.gateApplyReactivationReset(ctx, gateMgr, existing) {
-		// Reset fired; fall through to the rest of reconcile so a fresh PR
-		// gets created on the now-cleared state.
-	} else if loaded && existing.GetStatus() == StatusFailed &&
+	}
+
+	gateTrigger := ""
+	if loaded {
+		if gateMirrorLinearWorkflowState[T, PT](existing, issue) {
+			gateTrigger = TriggerLinearStateSync
+		}
+		if r.gateApplyReactivationReset(ctx, existing, issue) {
+			gateTrigger = TriggerReactivated
+		}
+		if gateTrigger != "" {
+			sctx := WithActor(ctx, r.identity)
+			sctx = WithTrigger(sctx, gateTrigger)
+			if _, err := gateMgr.Save(sctx, existing); err != nil {
+				// Persist failure here degrades downstream-mirror freshness
+				// for this reconcile but doesn't break correctness: the
+				// next reconcile re-reads Linear's workflow state and
+				// retries. Don't bail — fall through so the rest of
+				// reconcile can still make progress on whatever the agent
+				// path needs.
+				clog.WarnContext(ctx, "Gate-stage save failed; downstream consumers may stay stale until next reconcile", "error", err, "trigger", gateTrigger)
+			}
+		}
+	}
+
+	// Cancel-gate: closed-issue reconciles bail without invoking the agent.
+	// Runs AFTER the gate-stage save above so the human's "canceled"
+	// workflow-state flip is captured in State (and mirrored to downstream
+	// consumers) on the reconcile that observed it.
+	if isLinearTerminal(issue.State.Type) {
+		clog.InfoContext(ctx, "Issue is closed, skipping")
+		return nil
+	}
+
+	// NoDiff/NoProgress terminal gate: bot decided no work was possible
+	// (initial-run no-diff or K-iteration no-progress). These don't auto-
+	// cancel Linear, so a human reactivating doesn't tell us anything new
+	// — re-running would just reproduce the same no-op. Operators clear
+	// State manually to retry, same escape hatch the framework already
+	// documents.
+	if loaded && existing.GetStatus() == StatusFailed &&
 		(existing.GetFailureMode() == FailureModeNoDiff || existing.GetFailureMode() == FailureModeNoProgress) {
 		clog.InfoContextf(ctx, "Skipping reconcile: previously transitioned to %s (terminal). Clear state to retry.", existing.GetFailureMode())
 		return nil
@@ -538,27 +559,63 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 // issue knows what happened. Called from reconcileIssue when Upsert
 // returns changemanager.ErrNoChanges.
 //
-// gateApplyReactivationReset clears Failed/PRClosed terminal markers when
-// a human has reactivated a Linear issue (the early non-terminal-state
-// guard at the top of reconcileIssue ensures we only get here when Linear
-// is non-terminal). Returns true if the reset was applied; false otherwise.
+// isLinearTerminal reports whether a Linear workflow-state value is one
+// of the framework's recognised terminal types (completed/canceled).
+// Pure helper so the predicate is unit-testable independent of reconcile
+// flow.
+func isLinearTerminal(stateType string) bool {
+	return stateType == StateTypeCompleted || stateType == StateTypeCanceled
+}
+
+// gateMirrorLinearWorkflowState mutates `existing` so its LinearStateType
+// and LinearStateName mirror the live Linear issue's workflow state.
+// Returns true when fields were changed (caller persists), false on no-op.
 //
-// Predicate is intentionally narrow: only Failed/PRClosed warrants reset
-// because the other terminal failure modes (NoDiff, NoProgress) don't
-// auto-cancel Linear, so a human reactivating Linear gives no new signal —
-// re-running would just reproduce the same no-op. Operators clear State
-// manually to retry those, same escape hatch the framework already
-// documents.
+// Mutate-only: the caller batches this with other gate-stage mutations
+// into a single Save so a single reconcile produces at most one Linear
+// write and one History entry per reconcile (instead of one per gate
+// helper that fires).
 //
-// Persist failure is logged but non-fatal: downstream consumers will keep
-// showing the previous terminal state until the next reconcile retries
-// the reset, but the human's intent is captured in Linear's workflow
-// state, and the cleared-but-unsaved State here is local to this gateMgr
-// only — the next mgr.Load below will re-read whatever Linear has.
+// Refreshing this on EVERY reconcile — including reconciles that bail
+// from the cancel-gate (closed-issue skip) — is the whole reason this
+// helper exists: the bot's auto-cancel saveCallback only writes
+// Failed/PRClosed when the bot itself observes a closed PR, so
+// out-of-band cancellations driven from Linear UI / MCP / other sources
+// would otherwise never reach State, leaving downstream mirrors stuck
+// displaying a stale workflow-state forever.
+func gateMirrorLinearWorkflowState[T any, PT StateConstraint[T]](existing PT, issue *linearreconciler.Issue) bool {
+	if existing.GetLinearStateType() == issue.State.Type && existing.GetLinearStateName() == issue.State.Name {
+		return false
+	}
+	existing.SetLinearStateType(issue.State.Type)
+	existing.SetLinearStateName(issue.State.Name)
+	return true
+}
+
+// gateApplyReactivationReset mutates `existing` to clear Failed/PRClosed
+// terminal markers when a human has reactivated a Linear issue. Returns
+// true if the reset was applied; false otherwise.
+//
+// Mutate-only: the caller batches this with gateMirrorLinearWorkflowState
+// into a single Save. Predicate is:
+//
+//   - Linear must be non-terminal (cancel-gate fires below this stage,
+//     so we explicitly check here rather than relying on it).
+//   - State.Status==Failed && State.FailureMode==PRClosed.
+//
+// Predicate is intentionally narrow on the failure mode: only Failed/
+// PRClosed warrants reset because the other terminal failure modes
+// (NoDiff, NoProgress) don't auto-cancel Linear, so a human reactivating
+// Linear gives no new signal — re-running would just reproduce the same
+// no-op. Operators clear State manually to retry those, same escape hatch
+// the framework already documents.
 //
 // Extracted from inline gate-stage code so the predicate is unit-testable
 // without scaffolding a full reconcileIssue mock chain.
-func (r *Reconciler[Req, Resp, CB, T, PT]) gateApplyReactivationReset(ctx context.Context, gateMgr *StateManager[T, PT], existing PT) bool {
+func (r *Reconciler[Req, Resp, CB, T, PT]) gateApplyReactivationReset(ctx context.Context, existing PT, issue *linearreconciler.Issue) bool {
+	if isLinearTerminal(issue.State.Type) {
+		return false
+	}
 	if existing.GetStatus() != StatusFailed || existing.GetFailureMode() != FailureModePRClosed {
 		return false
 	}
@@ -575,11 +632,6 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) gateApplyReactivationReset(ctx contex
 	existing.SetCurrentFindings(nil)
 	existing.SetCurrentPendingChecks(nil)
 	existing.SetNoDiffIterationCount(0)
-	rctx := WithActor(ctx, r.identity)
-	rctx = WithTrigger(rctx, TriggerReactivated)
-	if _, err := gateMgr.Save(rctx, existing); err != nil {
-		clog.WarnContext(ctx, "Failed to persist reactivation reset; downstream consumers may stay stale until next reconcile", "error", err)
-	}
 	return true
 }
 

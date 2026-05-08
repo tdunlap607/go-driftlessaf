@@ -12,6 +12,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
 )
 
 const testActor = "test-bot"
@@ -562,74 +564,93 @@ func TestStateManager_ReactivationReset_ClearsTerminalFields(t *testing.T) {
 	}
 }
 
-// TestGateApplyReactivationReset_PredicateAndPersist exercises the
-// gateApplyReactivationReset helper directly with each terminal failure
-// mode. Locks in two contracts:
+// TestGateApplyReactivationReset_PredicateAndMutate exercises the
+// gateApplyReactivationReset helper directly. Locks in two contracts:
 //
-//  1. Predicate: only Failed/PRClosed triggers the reset. Failed/NoDiff
-//     and Failed/NoProgress (which don't auto-cancel Linear) must NOT
-//     reset, because the human reactivating Linear gives no new signal —
-//     re-running would just reproduce the same no-op.
-//  2. Persist: when the reset fires, the cleared fields land on the
-//     Linear attachment so the next mgr.Load below the gate sees the
-//     fresh state.
+//  1. Predicate: only fires when Linear is non-terminal AND
+//     Status==Failed && FailureMode==PRClosed. Failed/NoDiff and
+//     Failed/NoProgress (which don't auto-cancel Linear) must NOT reset,
+//     because the human reactivating Linear gives no new signal —
+//     re-running would just reproduce the same no-op. Linear-terminal
+//     issues must NOT reset either: the cancel-gate now runs AFTER this
+//     helper, so we explicitly check terminal here rather than relying
+//     on cancel-gate ordering.
+//  2. Mutate-only: the helper mutates `existing` in place and returns
+//     bool; it does NOT save. Caller batches mutations into a single
+//     gate-stage save for History-entry hygiene.
 //
-// Catches refactor regressions on the gate predicate (else-if chain at
-// the top of reconcileIssue) without needing a full reconcileIssue mock
-// chain — the harder e2e form is intentionally skipped because driving
-// changeSession + github clients + agent for a one-line predicate would
-// be net-negative for the test suite's signal-to-noise ratio.
-func TestGateApplyReactivationReset_PredicateAndPersist(t *testing.T) {
+// Catches refactor regressions on the gate predicate without needing a
+// full reconcileIssue mock chain — the harder e2e form is intentionally
+// skipped because driving changeSession + github clients + agent for a
+// one-line predicate would be net-negative for the test suite's
+// signal-to-noise ratio.
+func TestGateApplyReactivationReset_PredicateAndMutate(t *testing.T) {
 	tests := []struct {
-		name           string
-		initial        string
-		wantApplied    bool
-		wantStatusOut  Status
-		wantModeOut    FailureMode
-		wantPRURLOut   string
-		wantHistoryOut bool
+		name              string
+		initial           string
+		linearStateType   string
+		wantApplied       bool
+		wantStatusAfter   Status
+		wantPRURLAfter    string
+		wantNoDiffAfter   int
+		wantFindingsAfter int
 	}{
 		{
-			name:           "PRClosed triggers reset",
-			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed","current_findings":[{"kind":"ciCheck","identifier":"job-1"}],"current_pending_checks":["build"],"no_diff_iteration_count":2}`,
-			wantApplied:    true,
-			wantStatusOut:  StatusActive,
-			wantModeOut:    "",
-			wantPRURLOut:   "",
-			wantHistoryOut: true,
+			name:              "PRClosed + Linear non-terminal triggers reset",
+			initial:           `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed","current_findings":[{"kind":"ciCheck","identifier":"job-1"}],"current_pending_checks":["build"],"no_diff_iteration_count":2}`,
+			linearStateType:   "started",
+			wantApplied:       true,
+			wantStatusAfter:   StatusActive,
+			wantPRURLAfter:    "",
+			wantNoDiffAfter:   0,
+			wantFindingsAfter: 0,
 		},
 		{
-			name:           "NoDiff does not trigger reset",
-			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_diff"}`,
-			wantApplied:    false,
-			wantStatusOut:  StatusFailed,
-			wantModeOut:    FailureModeNoDiff,
-			wantPRURLOut:   "https://github.com/o/r/pull/1",
-			wantHistoryOut: false,
+			name:            "PRClosed + Linear canceled does NOT trigger reset",
+			initial:         `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed"}`,
+			linearStateType: "canceled",
+			wantApplied:     false,
+			wantStatusAfter: StatusFailed,
+			wantPRURLAfter:  "https://github.com/o/r/pull/1",
 		},
 		{
-			name:           "NoProgress does not trigger reset",
-			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_progress"}`,
-			wantApplied:    false,
-			wantStatusOut:  StatusFailed,
-			wantModeOut:    FailureModeNoProgress,
-			wantPRURLOut:   "https://github.com/o/r/pull/1",
-			wantHistoryOut: false,
+			name:            "PRClosed + Linear completed does NOT trigger reset",
+			initial:         `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed"}`,
+			linearStateType: "completed",
+			wantApplied:     false,
+			wantStatusAfter: StatusFailed,
+			wantPRURLAfter:  "https://github.com/o/r/pull/1",
 		},
 		{
-			name:           "Active status does not trigger reset",
-			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`,
-			wantApplied:    false,
-			wantStatusOut:  StatusActive,
-			wantModeOut:    "",
-			wantPRURLOut:   "https://github.com/o/r/pull/1",
-			wantHistoryOut: false,
+			name:            "NoDiff does not trigger reset",
+			initial:         `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_diff"}`,
+			linearStateType: "started",
+			wantApplied:     false,
+			wantStatusAfter: StatusFailed,
+			wantPRURLAfter:  "https://github.com/o/r/pull/1",
+		},
+		{
+			name:            "NoProgress does not trigger reset",
+			initial:         `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_progress"}`,
+			linearStateType: "started",
+			wantApplied:     false,
+			wantStatusAfter: StatusFailed,
+			wantPRURLAfter:  "https://github.com/o/r/pull/1",
+		},
+		{
+			name:            "Active status does not trigger reset",
+			initial:         `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`,
+			linearStateType: "started",
+			wantApplied:     false,
+			wantStatusAfter: StatusActive,
+			wantPRURLAfter:  "https://github.com/o/r/pull/1",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLinearStateFixture(t, tc.initial)
+			f.issue.State.Type = tc.linearStateType
 			r := newReconcilerForFixture(t, f)
 			mgr := r.NewStateManager(f.issue)
 
@@ -638,50 +659,227 @@ func TestGateApplyReactivationReset_PredicateAndPersist(t *testing.T) {
 				t.Fatalf("Load: %v", err)
 			}
 
-			got := r.gateApplyReactivationReset(t.Context(), mgr, s)
+			got := r.gateApplyReactivationReset(t.Context(), s, f.issue)
 			if got != tc.wantApplied {
 				t.Errorf("gateApplyReactivationReset returned: got = %v, want = %v", got, tc.wantApplied)
 			}
 
-			// When the reset fires, verify it landed on the Linear
-			// attachment (not just on the in-memory `s`).
+			// Mutate-only: helper must NOT save. Caller batches the save.
+			if saveCount := f.saveCount.Load(); saveCount != 0 {
+				t.Errorf("helper must not save; got saveCount = %d, want = 0", saveCount)
+			}
+
+			// Inspect the in-memory mutation on `s` directly.
+			if s.GetStatus() != tc.wantStatusAfter {
+				t.Errorf("Status after: got = %q, want = %q", s.GetStatus(), tc.wantStatusAfter)
+			}
+			if s.GetPRURL() != tc.wantPRURLAfter {
+				t.Errorf("PRURL after: got = %q, want = %q", s.GetPRURL(), tc.wantPRURLAfter)
+			}
 			if tc.wantApplied {
-				var saved State
-				loadSavedState(t, f, &saved)
-				if saved.Status != tc.wantStatusOut {
-					t.Errorf("persisted Status: got = %q, want = %q", saved.Status, tc.wantStatusOut)
+				if len(s.GetCurrentFindings()) != tc.wantFindingsAfter {
+					t.Errorf("CurrentFindings after: got len = %d, want = %d", len(s.GetCurrentFindings()), tc.wantFindingsAfter)
 				}
-				if saved.FailureMode != tc.wantModeOut {
-					t.Errorf("persisted FailureMode: got = %q, want = %q", saved.FailureMode, tc.wantModeOut)
+				if got := s.GetNoDiffIterationCount(); got != tc.wantNoDiffAfter {
+					t.Errorf("NoDiffIterationCount after: got = %d, want = %d", got, tc.wantNoDiffAfter)
 				}
-				if saved.PRURL != tc.wantPRURLOut {
-					t.Errorf("persisted PRURL: got = %q, want = %q", saved.PRURL, tc.wantPRURLOut)
-				}
-				if len(saved.CurrentFindings) != 0 {
-					t.Errorf("persisted CurrentFindings: got = %+v, want = empty", saved.CurrentFindings)
-				}
-				if len(saved.CurrentPendingChecks) != 0 {
-					t.Errorf("persisted CurrentPendingChecks: got = %+v, want = empty", saved.CurrentPendingChecks)
-				}
-				if got, want := saved.GetNoDiffIterationCount(), 0; got != want {
-					t.Errorf("persisted NoDiffIterationCount: got = %d, want = %d", got, want)
-				}
-				if tc.wantHistoryOut {
-					if got, want := len(saved.History), 1; got != want {
-						t.Fatalf("History len: got = %d, want = %d", got, want)
-					}
-					if saved.History[0].Trigger != TriggerReactivated {
-						t.Errorf("History[0].Trigger: got = %q, want = %q", saved.History[0].Trigger, TriggerReactivated)
-					}
-				}
-			} else {
-				// Predicate didn't fire — the in-memory state must be
-				// untouched (no Save call should have happened).
-				if got := f.saveCount.Load(); got != 0 {
-					t.Errorf("Save count when predicate didn't fire: got = %d, want = 0", got)
+				if s.GetFailureMode() != "" {
+					t.Errorf("FailureMode after: got = %q, want = empty", s.GetFailureMode())
 				}
 			}
 		})
+	}
+}
+
+// TestGateMirrorLinearWorkflowState exercises the linear-state mirror
+// gate helper. Mutate-only: returns true when it changed anything,
+// false on no-op. The caller batches the save.
+func TestGateMirrorLinearWorkflowState(t *testing.T) {
+	tests := []struct {
+		name          string
+		initialType   string
+		initialName   string
+		liveType      string
+		liveName      string
+		wantChanged   bool
+		wantTypeAfter string
+		wantNameAfter string
+	}{
+		{
+			name:          "first observation populates fields",
+			initialType:   "",
+			initialName:   "",
+			liveType:      "started",
+			liveName:      "In Progress",
+			wantChanged:   true,
+			wantTypeAfter: "started",
+			wantNameAfter: "In Progress",
+		},
+		{
+			name:          "type change (started → canceled)",
+			initialType:   "started",
+			initialName:   "In Progress",
+			liveType:      "canceled",
+			liveName:      "Canceled",
+			wantChanged:   true,
+			wantTypeAfter: "canceled",
+			wantNameAfter: "Canceled",
+		},
+		{
+			name:          "name-only change (team renamed In Progress → Working)",
+			initialType:   "started",
+			initialName:   "In Progress",
+			liveType:      "started",
+			liveName:      "Working",
+			wantChanged:   true,
+			wantTypeAfter: "started",
+			wantNameAfter: "Working",
+		},
+		{
+			name:          "no change is no-op",
+			initialType:   "started",
+			initialName:   "In Progress",
+			liveType:      "started",
+			liveName:      "In Progress",
+			wantChanged:   false,
+			wantTypeAfter: "started",
+			wantNameAfter: "In Progress",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &State{
+				LinearStateType: tc.initialType,
+				LinearStateName: tc.initialName,
+			}
+			issue := &linearreconciler.Issue{}
+			issue.State.Type = tc.liveType
+			issue.State.Name = tc.liveName
+
+			got := gateMirrorLinearWorkflowState[State, *State](s, issue)
+			if got != tc.wantChanged {
+				t.Errorf("changed: got = %v, want = %v", got, tc.wantChanged)
+			}
+			if s.LinearStateType != tc.wantTypeAfter {
+				t.Errorf("LinearStateType after: got = %q, want = %q", s.LinearStateType, tc.wantTypeAfter)
+			}
+			if s.LinearStateName != tc.wantNameAfter {
+				t.Errorf("LinearStateName after: got = %q, want = %q", s.LinearStateName, tc.wantNameAfter)
+			}
+		})
+	}
+}
+
+// TestStateManager_LinearStatePersist verifies that LinearStateType and
+// LinearStateName round-trip through Save/Load and trigger the dirty
+// check on change. The framework refreshes these from the live Linear
+// issue at the top of every reconcile so downstream consumers see the
+// human's workflow-state changes — including cancellations driven from
+// Linear UI / MCP that the bot's auto-cancel saveCallback never observes.
+func TestStateManager_LinearStatePersist(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s.SetLinearStateType("started")
+	s.SetLinearStateName("In Progress")
+
+	ctx := WithActor(t.Context(), testActor)
+	ctx = WithTrigger(ctx, TriggerLinearStateSync)
+	changed, err := mgr.Save(ctx, s)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed: got = false, want = true (linear-state change must persist)")
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got, want := saved.GetLinearStateType(), "started"; got != want {
+		t.Errorf("LinearStateType: got = %q, want = %q", got, want)
+	}
+	if got, want := saved.GetLinearStateName(), "In Progress"; got != want {
+		t.Errorf("LinearStateName: got = %q, want = %q", got, want)
+	}
+
+	// Same-value re-save is a no-op: snapshot refresh after the previous
+	// save means the linear-state fields don't look dirty this time.
+	noopChanged, err := mgr.Save(ctx, s)
+	if err != nil {
+		t.Fatalf("no-op Save: %v", err)
+	}
+	if noopChanged {
+		t.Errorf("no-op changed: got = true, want = false (same linear-state must not re-write)")
+	}
+}
+
+// TestReconcileIssue_GateTriggerPriority_ReactivationWins exercises the
+// trigger-priority orchestration in reconcileIssue's gate stage: when a
+// single reconcile observes BOTH a Linear workflow-state change AND the
+// PRClosed reactivation reset condition, the gate-stage Save must use
+// TriggerReactivated (not TriggerLinearStateSync) so the History entry
+// records the more significant transition.
+//
+// Mirrors the orchestration at the top of reconcileIssue (gateMirror →
+// gateApplyReactivationReset → conditional Save) directly, since
+// scaffolding the full reconcileIssue path requires github + change-
+// session mocks. Locks in the contract that the second helper's trigger
+// overwrites the first's when both fire, AND that the persisted History
+// entry's Trigger field reflects the post-overwrite value.
+func TestReconcileIssue_GateTriggerPriority_ReactivationWins(t *testing.T) {
+	// Fixture: Linear issue is now non-terminal (started), but State has
+	// stale linear-state metadata (canceled) AND is in the bot-auto-cancel
+	// terminal mode (Failed/PRClosed). Both gate predicates must fire.
+	const initial = `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed","linear_state_type":"canceled","linear_state_name":"Canceled"}`
+	f := newLinearStateFixture(t, initial)
+	f.issue.State.Type = "started"
+	f.issue.State.Name = "In Progress"
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	gateTrigger := ""
+	if gateMirrorLinearWorkflowState[State, *State](s, f.issue) {
+		gateTrigger = TriggerLinearStateSync
+	}
+	if r.gateApplyReactivationReset(t.Context(), s, f.issue) {
+		gateTrigger = TriggerReactivated
+	}
+	if gateTrigger != TriggerReactivated {
+		t.Fatalf("trigger after both helpers fired: got = %q, want = %q (reactivation must win)", gateTrigger, TriggerReactivated)
+	}
+
+	sctx := WithActor(t.Context(), testActor)
+	sctx = WithTrigger(sctx, gateTrigger)
+	if _, err := mgr.Save(sctx, s); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	// Reactivation cleared the failure mode and bumped to Active — the
+	// status transition triggers a History append using the Save's
+	// trigger. Linear-state mirror's contribution to the same Save is
+	// invisible in History (mirror-only changes don't transition Status/
+	// Mode), but its field changes are persisted alongside.
+	if got, want := len(saved.History), 1; got != want {
+		t.Fatalf("History len: got = %d, want = %d", got, want)
+	}
+	if got, want := saved.History[0].Trigger, TriggerReactivated; got != want {
+		t.Errorf("History[0].Trigger: got = %q, want = %q (reactivation must win over linear-state-sync)", got, want)
+	}
+	if got, want := saved.GetLinearStateType(), "started"; got != want {
+		t.Errorf("LinearStateType: got = %q, want = %q (mirror change must persist alongside reactivation)", got, want)
 	}
 }
 

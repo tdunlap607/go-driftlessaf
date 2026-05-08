@@ -58,6 +58,8 @@ type StateManager[T any, PT StateConstraint[T]] struct {
 	snapshotFindings      []FindingRef
 	snapshotPendingChecks []string
 	snapshotNoDiffCount   int
+	snapshotLinearType    string
+	snapshotLinearName    string
 	loaded                bool
 	now                   func() time.Time // injectable clock for tests
 	cb                    SaveCallback
@@ -147,6 +149,8 @@ func (m *StateManager[T, PT]) Load(ctx context.Context) (PT, bool, error) {
 	m.snapshotFindings = slices.Clone(pt.GetCurrentFindings())
 	m.snapshotPendingChecks = slices.Clone(pt.GetCurrentPendingChecks())
 	m.snapshotNoDiffCount = pt.GetNoDiffIterationCount()
+	m.snapshotLinearType = pt.GetLinearStateType()
+	m.snapshotLinearName = pt.GetLinearStateName()
 	m.loaded = loaded
 	return pt, loaded, nil
 }
@@ -214,12 +218,15 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	currentFindings := pt.GetCurrentFindings()
 	currentPendingChecks := pt.GetCurrentPendingChecks()
 	currentNoDiffCount := pt.GetNoDiffIterationCount()
+	currentLinearType := pt.GetLinearStateType()
+	currentLinearName := pt.GetLinearStateName()
 
 	statusOrModeChanged := currentStatus != m.snapshotStatus || currentFailureMode != m.snapshotFailureMode
 	prURLChanged := currentPRURL != m.snapshotPRURL
 	findingsChanged := !slices.Equal(currentFindings, m.snapshotFindings)
 	pendingChecksChanged := !slices.Equal(currentPendingChecks, m.snapshotPendingChecks)
 	noDiffCountChanged := currentNoDiffCount != m.snapshotNoDiffCount
+	linearStateChanged := currentLinearType != m.snapshotLinearType || currentLinearName != m.snapshotLinearName
 
 	// Persist to Linear when any tracked field changed, when the bot opted
 	// in via BeforeSave, OR when we never loaded (first save creates the
@@ -233,7 +240,7 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	// PRURL-only and findings/pending-only changes save without a History
 	// append — a from==to entry would mislead observability — but the
 	// fields themselves must persist so consumers see current state.
-	linearDirty := statusOrModeChanged || prURLChanged || findingsChanged || pendingChecksChanged || noDiffCountChanged || botForcedDirty || !m.loaded
+	linearDirty := statusOrModeChanged || prURLChanged || findingsChanged || pendingChecksChanged || noDiffCountChanged || linearStateChanged || botForcedDirty || !m.loaded
 
 	if statusOrModeChanged {
 		actor, _ := ActorFromContext(ctx)
@@ -293,6 +300,8 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 		m.snapshotFindings = slices.Clone(currentFindings)
 		m.snapshotPendingChecks = slices.Clone(currentPendingChecks)
 		m.snapshotNoDiffCount = currentNoDiffCount
+		m.snapshotLinearType = currentLinearType
+		m.snapshotLinearName = currentLinearName
 		m.loaded = true
 	}
 

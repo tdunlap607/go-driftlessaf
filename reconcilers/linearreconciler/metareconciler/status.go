@@ -99,6 +99,25 @@ const (
 	// markers so the bot can re-engage. Only fires for the PRClosed flavour
 	// of canceled — NoDiff and NoProgress remain operator-cleared.
 	TriggerReactivated = "reactivated"
+	// TriggerLinearStateSync is set on the gate-stage Save's context when
+	// reconcile observes a Linear workflow-state change. Visible to post-
+	// save callback consumers via TriggerFromContext; NOT appended to
+	// State.History — mirror-only changes don't transition Status/Mode,
+	// and StateManager.Save only appends a History entry on
+	// statusOrModeChanged (manager.go), so a from==to entry would be
+	// misleading observability.
+	//
+	// When a single reconcile observes both a workflow-state change AND
+	// the bot-auto-cancel reactivation reset condition, the gate-stage
+	// Save uses TriggerReactivated instead — reactivation does
+	// transition Status/Mode and so DOES appear in History as the
+	// canonical record of the more significant transition.
+	//
+	// Distinct from TriggerReactivated in semantics: sync fires for ANY
+	// workflow-state change (started → in_review, canceled →
+	// in_progress, etc.) whereas reactivated only fires when clearing
+	// bot auto-cancel markers.
+	TriggerLinearStateSync = "linear_state_sync"
 )
 
 // State is the framework's persistent state-machine record for a single
@@ -139,6 +158,20 @@ type State struct {
 	// schema-validate to surface it. The framework itself doesn't
 	// import jsonschema; the tag is purely metadata.
 	NoDiffIterationCount int `json:"no_diff_iteration_count,omitempty" jsonschema:"minimum=0"`
+	// LinearStateType mirrors the Linear workflow-state type observed at
+	// the most recent reconcile (e.g. "started", "canceled", "completed",
+	// "triage", "backlog", "unstarted"). Refreshed at the top of every
+	// reconcile so downstream mirrors see the human's workflow-state
+	// changes even when the framework's reconcile flow returns nil from
+	// a gate (closed-issue skip, etc.). The framework manages this
+	// field — bots never set it themselves.
+	LinearStateType string `json:"linear_state_type,omitempty"`
+	// LinearStateName mirrors the human-readable Linear workflow-state
+	// name observed at the most recent reconcile (e.g. "In Progress",
+	// "Canceled", "Done"). Same lifecycle as LinearStateType; carried
+	// alongside the type so downstream consumers can render the actual
+	// team-configured label without re-querying Linear.
+	LinearStateName string `json:"linear_state_name,omitempty"`
 }
 
 // pendingChecksCap bounds the persisted CurrentPendingChecks list to
@@ -246,6 +279,22 @@ func (s *State) GetNoDiffIterationCount() int { return s.NoDiffIterationCount }
 // and resets to 0 on any iteration that produces a commit.
 func (s *State) SetNoDiffIterationCount(n int) { s.NoDiffIterationCount = n }
 
+// GetLinearStateType returns the most-recently-observed Linear workflow-
+// state type. Part of the StateMachine interface.
+func (s *State) GetLinearStateType() string { return s.LinearStateType }
+
+// SetLinearStateType records the Linear workflow-state type observed at
+// reconcile. Part of the StateMachine interface; framework-managed.
+func (s *State) SetLinearStateType(t string) { s.LinearStateType = t }
+
+// GetLinearStateName returns the most-recently-observed Linear workflow-
+// state human-readable name. Part of the StateMachine interface.
+func (s *State) GetLinearStateName() string { return s.LinearStateName }
+
+// SetLinearStateName records the Linear workflow-state name observed at
+// reconcile. Part of the StateMachine interface; framework-managed.
+func (s *State) SetLinearStateName(n string) { s.LinearStateName = n }
+
 // SetFailureMode sets the FailureMode. Part of the StateMachine interface.
 func (s *State) SetFailureMode(fm FailureMode) { s.FailureMode = fm }
 
@@ -337,6 +386,19 @@ type StateMachine interface {
 	// transitions to StatusFailed + FailureModeNoProgress.
 	GetNoDiffIterationCount() int
 	SetNoDiffIterationCount(int)
+	// GetLinearStateType / SetLinearStateType expose the Linear
+	// workflow-state type observed at reconcile (e.g. "started",
+	// "canceled"). Framework-managed: refreshed at the top of every
+	// reconcile so downstream mirrors see human workflow-state changes
+	// — including out-of-band cancellations driven from Linear UI / MCP
+	// that the bot's saveCallback never observes.
+	GetLinearStateType() string
+	SetLinearStateType(string)
+	// GetLinearStateName / SetLinearStateName expose the human-
+	// readable Linear workflow-state name (e.g. "In Progress",
+	// "Canceled"). Framework-managed alongside LinearStateType.
+	GetLinearStateName() string
+	SetLinearStateName(string)
 	// SetIssueID and SetIssueURL are called by StateManager.Save before
 	// every persist, with values captured from the *Issue at
 	// NewStateManager time. Bots never call these themselves — when a
