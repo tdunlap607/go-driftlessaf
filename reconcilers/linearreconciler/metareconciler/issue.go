@@ -26,9 +26,13 @@ import (
 // IMPORTANT: Linear uses American spelling — "canceled" (one L), NOT
 // "cancelled" (two L's). Both the "Cancelled" and "Duplicate" UI states
 // map to type=canceled. The "Done" UI state maps to type=completed.
+//
+// Exported so consumers (e.g. bot SaveCallbacks reacting to terminal
+// state transitions) can gate on the canonical Linear type without
+// copying magic strings.
 const (
-	stateTypeCompleted = "completed"
-	stateTypeCanceled  = "canceled"
+	StateTypeCompleted = "completed"
+	StateTypeCanceled  = "canceled"
 )
 
 // reconcileIssue resolves the repo target from the Linear issue, then runs the
@@ -43,7 +47,7 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		return nil
 	}
 
-	if issue.State.Type == stateTypeCompleted || issue.State.Type == stateTypeCanceled {
+	if issue.State.Type == StateTypeCompleted || issue.State.Type == StateTypeCanceled {
 		clog.InfoContext(ctx, "Issue is closed, skipping")
 		return nil
 	}

@@ -259,7 +259,7 @@ func TestDispatchMergedOrRequeue(t *testing.T) {
 }
 
 // TestStateTypeConstants_MatchLinearEnum prevents a regression where the
-// stateTypeCanceled constant carried British "cancelled" spelling while
+// StateTypeCanceled constant carried British "cancelled" spelling while
 // Linear's GraphQL API returns the American "canceled" — the gate at
 // reconcileIssue:45 silently never fired for cancelled issues, so an
 // issue cancelled in Linear could still trigger PR creation. Linear's
@@ -269,8 +269,8 @@ func TestDispatchMergedOrRequeue(t *testing.T) {
 // See https://developers.linear.app/docs/graphql/working-with-the-graphql-api/workflow-states
 func TestStateTypeConstants_MatchLinearEnum(t *testing.T) {
 	cases := map[string]string{
-		"completed": stateTypeCompleted,
-		"canceled":  stateTypeCanceled,
+		"completed": StateTypeCompleted,
+		"canceled":  StateTypeCanceled,
 	}
 	for want, got := range cases {
 		if got != want {
