@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -20,6 +21,7 @@ import (
 	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
 	"github.com/chainguard-dev/clog"
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/google/go-github/v84/github"
 )
 
 // Linear workflow state types. See
@@ -132,6 +134,73 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		return fmt.Errorf("create change session: %w", err)
 	}
 	state := changeSession.State()
+
+	// PR-terminal detection: changeSession.NewSession only queries OPEN PRs,
+	// so when a PR has been closed or merged it appears as state.HasPR() ==
+	// false. If we previously knew of a PR (PRURL set on State) but it's no
+	// longer open, fetch it directly to determine merged-vs-closed and apply
+	// the corresponding terminal transition. This runs here on the linear
+	// workqueue's per-key serialization rather than via a parallel
+	// github-workqueue handler, so Save calls for this Linear issue are
+	// totally ordered and post-save observers see a consistent state machine.
+	//
+	// Steady-state cost is zero extra GitHub API calls per reconcile, not one:
+	// after the terminal Save lands, subsequent reconciles short-circuit at
+	// the gate above (Linear-terminal early return at the top of this
+	// function, or the Failed/NoDiff|NoProgress skip in the gate stage)
+	// before ever reaching here. The PR fetch only fires on the one
+	// reconcile that observes the close.
+	//
+	// `loaded` is in the guard intentionally: on `gateLoadErr != nil` we
+	// don't have a trustworthy `existing.GetPRURL()` (it would be a
+	// zero-value PT), so we deliberately defer PR-terminal detection to
+	// the next reconcile after a successful Load.
+	if !state.HasPR() && loaded && existing.GetPRURL() != "" {
+		prRes, perr := githubreconciler.ParseURL(existing.GetPRURL())
+		if perr != nil {
+			clog.WarnContext(ctx, "PR-terminal detection: cannot parse stored PRURL, falling through", "error", perr, "pr_url", existing.GetPRURL())
+		} else {
+			// prGH is intentionally a separate client lookup from the `gh`
+			// client at line 148: gh is for the resolved-target repo
+			// (owner/repo from resolveRepoTarget), while prGH is for whatever
+			// owner/repo the stored PRURL parses to. Common case they're the
+			// same; they'd legitimately diverge if the issue's resolved repo
+			// target changed since the PR was created.
+			prGH, perr := r.githubClients.Get(ctx, prRes.Owner, prRes.Repo)
+			if perr != nil {
+				return fmt.Errorf("PR-terminal detection: get GitHub client: %w", perr)
+			}
+			pr, resp, perr := prGH.PullRequests.Get(ctx, prRes.Owner, prRes.Repo, prRes.Number)
+			if perr != nil {
+				// 404 means the PR is no longer accessible (hard-deleted, repo
+				// transferred, installation revoked). Without this special-case
+				// we'd retry on the workqueue forever and the issue would stay
+				// stuck. Treat the same as ParseURL failure above: warn and
+				// fall through, letting the !state.HasPR() switch case below
+				// create a fresh PR.
+				if resp != nil && resp.StatusCode == http.StatusNotFound {
+					clog.WarnContext(ctx, "PR-terminal detection: stored PR returned 404, falling through to fresh-PR path", "pr_url", existing.GetPRURL())
+				} else {
+					return fmt.Errorf("PR-terminal detection: fetch previously-known PR: %w", perr)
+				}
+			} else {
+				// Reuse gateMgr (rather than constructing a fresh
+				// r.NewStateManager) so StateManager's diff/History append
+				// is computed against the load at the top of reconcileIssue,
+				// not against a re-Loaded snapshot that could miss intervening
+				// fields cleared by the gate stage (e.g. the reactivation
+				// reset).
+				if done, terr := r.maybeTransitionFromPRState(ctx, gateMgr, existing, pr); terr != nil {
+					return terr
+				} else if done {
+					return nil
+				}
+				// PR is in a state we don't transition on (e.g., reopened); fall
+				// through to normal flow. changeSession's switch handles the rest.
+			}
+		}
+	}
+
 	var (
 		usePRBranch bool
 		// trigger classifies why the agent is being invoked, recorded on the
@@ -554,6 +623,53 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) transitionToNoDiff(ctx context.Contex
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
+}
+
+// maybeTransitionFromPRState inspects a previously-known PR and, when it
+// has reached a terminal GitHub state (merged or closed-without-merge),
+// applies the corresponding State transition: merged → StatusComplete,
+// closed → StatusFailed + FailureModePRClosed. Returns (true, nil) when
+// a transition was applied (caller should bail from reconcile);
+// (false, nil) when the PR is in a non-terminal or unexpected state
+// (caller falls through to normal flow); (false, err) on a fatal Save
+// error.
+//
+// Pure-helper signature (takes *github.PullRequest rather than fetching
+// it itself) so callers can route the github API call however they like
+// — the test suite passes constructed PR objects directly. Lives in the
+// linear-workqueue path; replaces the github-workqueue's transitionPR
+// (which raced cross-workqueue and produced inconsistent post-save
+// snapshots).
+func (r *Reconciler[Req, Resp, CB, T, PT]) maybeTransitionFromPRState(ctx context.Context, mgr *StateManager[T, PT], existing PT, pr *github.PullRequest) (bool, error) {
+	var (
+		targetStatus  Status
+		targetMode    FailureMode
+		targetTrigger string
+	)
+	switch {
+	case pr.GetMerged():
+		targetStatus = StatusComplete
+		targetTrigger = TriggerPRMerge
+		clog.InfoContext(ctx, "Previously-known PR was merged; transitioning to StatusComplete")
+	case pr.GetState() == "closed":
+		targetStatus = StatusFailed
+		targetMode = FailureModePRClosed
+		targetTrigger = TriggerPRClosed
+		clog.InfoContext(ctx, "Previously-known PR was closed without merge; transitioning to StatusFailed/PRClosed")
+	default:
+		// Open or unexpected state — caller falls through to normal flow.
+		return false, nil
+	}
+	existing.SetStatus(targetStatus)
+	if targetMode != "" {
+		existing.SetFailureMode(targetMode)
+	}
+	tctx := WithActor(ctx, r.identity)
+	tctx = WithTrigger(tctx, targetTrigger)
+	if _, err := mgr.Save(tctx, existing); err != nil {
+		return false, fmt.Errorf("save terminal transition: %w", err)
+	}
+	return true, nil
 }
 
 // snapshotFindings projects the live changemanager findings into the

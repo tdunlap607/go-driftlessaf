@@ -6,18 +6,25 @@ SPDX-License-Identifier: Apache-2.0
 package metareconciler
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"text/template"
 
 	"chainguard.dev/driftlessaf/agents/promptbuilder"
+	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
+	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/changemanager"
 	"chainguard.dev/driftlessaf/reconcilers/linearreconciler"
 	"github.com/google/go-github/v84/github"
+	"golang.org/x/oauth2"
 )
 
 // Trivial test types to satisfy the Reconciler's generic constraints.
@@ -168,82 +175,79 @@ func (f *linearStateFixture) newClient(t *testing.T) *linearreconciler.Client {
 	return client
 }
 
-// TestDispatchMergedOrRequeue exercises the three-way decision in
-// (*Reconciler).dispatchMergedOrRequeue: a merged PR must persist
-// StatusComplete, a closed-without-merge PR must persist StatusFailed/pr_closed,
-// and an open PR must re-queue without touching state.
-func TestDispatchMergedOrRequeue(t *testing.T) {
+// TestMaybeTransitionFromPRState exercises the merged/closed/open
+// decision in (*Reconciler).maybeTransitionFromPRState. This is the
+// linear-workqueue-side helper that replaced the github-workqueue's
+// transitionPR — same per-case behaviour, but the Save now happens
+// inside reconcileIssue so it serializes with every other write to this
+// Linear issue's State.
+func TestMaybeTransitionFromPRState(t *testing.T) {
 	const prURL = "https://github.com/o/r/pull/1"
 
 	tests := []struct {
-		name            string
-		merged          bool
-		state           string // GitHub PR state: "open" or "closed"
-		wantRequeueKeys int
-		wantSaveCount   int32
-		wantStatusJSON  string // substring expected in the saved state, if any save happened
+		name           string
+		merged         bool
+		state          string // GitHub PR state: "open" or "closed"
+		wantDone       bool
+		wantSaveCount  int32
+		wantStatusJSON string // substring expected in the saved state, if any save happened
 	}{
 		{
-			name:            "merged → mark complete, no requeue",
-			merged:          true,
-			state:           "closed", // merged PRs are also closed
-			wantRequeueKeys: 0,
-			wantSaveCount:   1,
-			wantStatusJSON:  `"status":"complete"`,
+			name:           "merged → mark complete, done",
+			merged:         true,
+			state:          "closed", // merged PRs are also closed in GitHub's model
+			wantDone:       true,
+			wantSaveCount:  1,
+			wantStatusJSON: `"status":"complete"`,
 		},
 		{
 			// Defensive case: GitHub never returns merged=true with state=open
 			// in practice, but locking this in guards against future refactors
-			// that could reorder the merged/closed branches in dispatchMergedOrRequeue.
-			name:            "merged with state=open (defensive) → mark complete, no requeue",
-			merged:          true,
-			state:           "open",
-			wantRequeueKeys: 0,
-			wantSaveCount:   1,
-			wantStatusJSON:  `"status":"complete"`,
+			// that could reorder the merged/closed branches.
+			name:           "merged with state=open (defensive) → mark complete, done",
+			merged:         true,
+			state:          "open",
+			wantDone:       true,
+			wantSaveCount:  1,
+			wantStatusJSON: `"status":"complete"`,
 		},
 		{
-			name:            "closed without merge → mark failed (pr_closed), no requeue",
-			merged:          false,
-			state:           "closed",
-			wantRequeueKeys: 0,
-			wantSaveCount:   1,
-			wantStatusJSON:  `"status":"failed"`,
+			name:           "closed without merge → mark failed (pr_closed), done",
+			merged:         false,
+			state:          "closed",
+			wantDone:       true,
+			wantSaveCount:  1,
+			wantStatusJSON: `"status":"failed"`,
 		},
 		{
-			name:            "open PR → requeue, no state change",
-			merged:          false,
-			state:           "open",
-			wantRequeueKeys: 1,
-			wantSaveCount:   0,
+			name:          "open PR → no transition, fall through (caller continues normal flow)",
+			merged:        false,
+			state:         "open",
+			wantDone:      false,
+			wantSaveCount: 0,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLinearStateFixture(t, `{"pr_url":"`+prURL+`","status":"active"}`)
-			client := f.newClient(t)
-
-			// Build a minimal Reconciler with just the fields dispatch uses.
-			// The Req/Resp/CB type params are unused by dispatch; pick trivial
-			// types just to satisfy generics. State type is the framework's
-			// own State (no bot extensions needed for this test).
-			r := &Reconciler[testReq, testResp, testCB, State, *State]{
-				identity:     "test-bot",
-				linearClient: client,
+			r := newReconcilerForFixture(t, f)
+			mgr := r.NewStateManager(f.issue)
+			existing, _, err := mgr.Load(t.Context())
+			if err != nil {
+				t.Fatalf("Load: %v", err)
 			}
 
 			pr := &github.PullRequest{
 				Merged: github.Ptr(tc.merged),
 				State:  github.Ptr(tc.state),
 			}
-			resp, err := r.dispatchMergedOrRequeue(t.Context(), pr, f.issue.ID, prURL)
+			done, err := r.maybeTransitionFromPRState(t.Context(), mgr, existing, pr)
 			if err != nil {
-				t.Fatalf("dispatchMergedOrRequeue: %v", err)
+				t.Fatalf("maybeTransitionFromPRState: %v", err)
 			}
-
-			if got := len(resp.QueueKeys); got != tc.wantRequeueKeys {
-				t.Errorf("len(QueueKeys): got = %d, want = %d", got, tc.wantRequeueKeys)
+			if done != tc.wantDone {
+				t.Errorf("done: got = %v, want = %v", done, tc.wantDone)
 			}
 			if got := f.saveCount.Load(); got != tc.wantSaveCount {
 				t.Errorf("save count: got = %d, want = %d", got, tc.wantSaveCount)
@@ -253,6 +257,167 @@ func TestDispatchMergedOrRequeue(t *testing.T) {
 				if !strings.Contains(saved, tc.wantStatusJSON) {
 					t.Errorf("saved state: got = %q, want substring %q", saved, tc.wantStatusJSON)
 				}
+				// Lock in PRURL preservation through the terminal Save: the
+				// old transitionPR path had explicit PRURL-backfill logic
+				// that maybeTransitionFromPRState dropped. If a future
+				// refactor accidentally clears PRURL on the terminal write,
+				// downstream consumers would lose the link to the closed/
+				// merged PR.
+				if !strings.Contains(saved, prURL) {
+					t.Errorf("saved state lost PRURL on terminal transition: got = %q, want substring %q", saved, prURL)
+				}
+			}
+		})
+	}
+}
+
+// TestHandlePREvent_RoutingOnlyDoesNotWriteState locks in the load-bearing
+// invariant of this refactor: HandlePREvent MUST NOT write State,
+// regardless of what the github fetch returns. Pre-refactor the function
+// (then transitionPR) wrote State directly from the github workqueue,
+// racing with reconcileIssue's writes on the linear workqueue. The whole
+// point of moving terminal-transition logic into reconcileIssue was to
+// eliminate that race; if a future contributor adds a Save call back into
+// HandlePREvent, this test fires immediately rather than reproducing the
+// stale-mirror bug in production.
+//
+// Table-driven across the routing decisions HandlePREvent makes against
+// the PR body: marker-present + LinearIssueID populated (the success
+// path), marker-present + empty LinearIssueID (skip-with-warn),
+// marker-absent (skip-with-info). Each case must produce zero State
+// writes; the success path additionally must enqueue the LinearIssueID.
+func TestHandlePREvent_RoutingOnlyDoesNotWriteState(t *testing.T) {
+	const (
+		prURL         = "https://github.com/o/r/pull/1"
+		linearIssueID = "issue-1"
+	)
+
+	// Marker format mirrors internal/template's Embed:
+	//   <!--{identity}-pr-data-->
+	//   <!--
+	//   {json}
+	//   -->
+	//   <!--/{identity}-pr-data-->
+	prBodyWithID := fmt.Sprintf("Some body.\n\n<!--%s-pr-data-->\n<!--\n%s\n-->\n<!--/%s-pr-data-->",
+		testActor,
+		`{"identity":"`+testActor+`","linear_issue_id":"`+linearIssueID+`","linear_identifier":"TEST-1","description_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
+		testActor,
+	)
+	prBodyEmptyID := fmt.Sprintf("Some body.\n\n<!--%s-pr-data-->\n<!--\n%s\n-->\n<!--/%s-pr-data-->",
+		testActor,
+		`{"identity":"`+testActor+`","linear_issue_id":"","linear_identifier":"","description_hash":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
+		testActor,
+	)
+	prBodyNoMarker := "A perfectly normal PR body with no materializer marker."
+
+	tests := []struct {
+		name           string
+		body           string
+		state          string
+		merged         bool
+		wantQueueCount int
+		wantQueueKey   string
+	}{
+		{
+			name:           "marker present, LinearIssueID set, PR closed → enqueue, no State write",
+			body:           prBodyWithID,
+			state:          "closed",
+			wantQueueCount: 1,
+			wantQueueKey:   linearIssueID,
+		},
+		{
+			name:           "marker present, LinearIssueID set, PR merged → enqueue, no State write",
+			body:           prBodyWithID,
+			state:          "closed",
+			merged:         true,
+			wantQueueCount: 1,
+			wantQueueKey:   linearIssueID,
+		},
+		{
+			name:           "marker present, LinearIssueID set, PR open → enqueue, no State write",
+			body:           prBodyWithID,
+			state:          "open",
+			wantQueueCount: 1,
+			wantQueueKey:   linearIssueID,
+		},
+		{
+			name:           "marker present, empty LinearIssueID → skip, no State write",
+			body:           prBodyEmptyID,
+			state:          "closed",
+			wantQueueCount: 0,
+		},
+		{
+			name:           "no marker → skip, no State write",
+			body:           prBodyNoMarker,
+			state:          "closed",
+			wantQueueCount: 0,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLinearStateFixture(t, `{"pr_url":"`+prURL+`","status":"active"}`)
+
+			// Stand up a minimal GitHub mock returning a PR with the
+			// given body. The fetch is the only github call HandlePREvent
+			// makes — overriding the cached client's BaseURL is the
+			// least-invasive way to redirect it.
+			ghServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id":     1,
+					"number": 1,
+					"state":  tc.state,
+					"merged": tc.merged,
+					"body":   tc.body,
+				})
+			}))
+			t.Cleanup(ghServer.Close)
+
+			cc := githubreconciler.NewClientCache(func(_ context.Context, _, _ string) (oauth2.TokenSource, error) {
+				return oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test"}), nil
+			})
+			ghClient, err := cc.Get(t.Context(), "o", "r")
+			if err != nil {
+				t.Fatalf("ClientCache.Get: %v", err)
+			}
+			baseURL, _ := url.Parse(ghServer.URL + "/")
+			ghClient.BaseURL = baseURL
+
+			titleTmpl, err := template.New("title").Parse("test title")
+			if err != nil {
+				t.Fatalf("title template: %v", err)
+			}
+			bodyTmpl, err := template.New("body").Parse("test body")
+			if err != nil {
+				t.Fatalf("body template: %v", err)
+			}
+			cm, err := changemanager.New[PRData[testReq]](testActor, titleTmpl, bodyTmpl)
+			if err != nil {
+				t.Fatalf("changemanager.New: %v", err)
+			}
+
+			r := newReconcilerForFixture(t, f)
+			r.githubClients = cc
+			r.changeManager = cm
+
+			resp, err := r.HandlePREvent(t.Context(), prURL)
+			if err != nil {
+				t.Fatalf("HandlePREvent: %v", err)
+			}
+
+			if got := len(resp.QueueKeys); got != tc.wantQueueCount {
+				t.Errorf("QueueKeys count: got = %d, want = %d", got, tc.wantQueueCount)
+			}
+			if tc.wantQueueKey != "" && len(resp.QueueKeys) > 0 {
+				if got := resp.QueueKeys[0].Key; got != tc.wantQueueKey {
+					t.Errorf("queue key: got = %q, want = %q", got, tc.wantQueueKey)
+				}
+			}
+			// The headline assertion: HandlePREvent is purely a router and
+			// must not touch State for ANY input. Cross-workqueue race
+			// regression caught here, not in production.
+			if got := f.saveCount.Load(); got != 0 {
+				t.Errorf("State saveCount: got = %d, want = 0 (HandlePREvent must be routing-only)", got)
 			}
 		})
 	}
