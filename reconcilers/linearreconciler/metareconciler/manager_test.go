@@ -417,6 +417,483 @@ func TestStateManager_FindingsAndPendingChangesPersist(t *testing.T) {
 	}
 }
 
+// TestFindingsEqual covers the order-insensitive snapshot comparison the
+// HasFindings dedup uses to decide whether the agent has already iterated
+// against this exact set of CI findings. Pin each case so future tweaks
+// to the comparison heuristic don't silently change which webhook bursts
+// get deduped.
+func TestFindingsEqual(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b []FindingRef
+		want bool
+	}{
+		{
+			name: "both empty are equal",
+			a:    nil,
+			b:    []FindingRef{},
+			want: true,
+		},
+		{
+			name: "different lengths are not equal",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1"}},
+			b:    []FindingRef{{Kind: "ciCheck", Identifier: "1"}, {Kind: "ciCheck", Identifier: "2"}},
+			want: false,
+		},
+		{
+			name: "same set, same order",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1", Name: "build"}},
+			b:    []FindingRef{{Kind: "ciCheck", Identifier: "1", Name: "build"}},
+			want: true,
+		},
+		{
+			name: "same set, reversed order (sort makes them equal)",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1"}, {Kind: "ciCheck", Identifier: "2"}},
+			b:    []FindingRef{{Kind: "ciCheck", Identifier: "2"}, {Kind: "ciCheck", Identifier: "1"}},
+			want: true,
+		},
+		{
+			name: "different identifier (re-run with new job ID counts as different)",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1"}},
+			b:    []FindingRef{{Kind: "ciCheck", Identifier: "2"}},
+			want: false,
+		},
+		{
+			name: "same identifier, different name (still treated as different — fields compared whole)",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1", Name: "build"}},
+			b:    []FindingRef{{Kind: "ciCheck", Identifier: "1", Name: "lint"}},
+			want: false,
+		},
+		{
+			name: "different kind disambiguates same identifier",
+			a:    []FindingRef{{Kind: "ciCheck", Identifier: "1"}},
+			b:    []FindingRef{{Kind: "review", Identifier: "1"}},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := findingsEqual(tc.a, tc.b); got != tc.want {
+				t.Errorf("findingsEqual(%v, %v) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStateManager_ReactivationReset_ClearsTerminalFields exercises the
+// state mutation pattern reconcileIssue applies when a human moves a
+// previously-canceled Linear issue back to a non-terminal workflow state:
+// transition Status from Failed back to Active, clear FailureMode, drop
+// PRURL/findings/pending/no-diff-counter so the next reconcile starts
+// fresh from the !state.HasPR branch.
+//
+// Pins the exact set of fields that get cleared. If a future change adds
+// a new sticky terminal-marker field, this test should grow to include it
+// — otherwise stale data leaks into the post-reactivation reconcile.
+func TestStateManager_ReactivationReset_ClearsTerminalFields(t *testing.T) {
+	const initial = `{
+		"pr_url":"https://github.com/o/r/pull/41",
+		"status":"failed",
+		"failure_mode":"pr_closed",
+		"current_findings":[{"kind":"ciCheck","identifier":"job-1"}],
+		"current_pending_checks":["build"],
+		"no_diff_iteration_count":2
+	}`
+	f := newLinearStateFixture(t, initial)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Apply the same mutations reconcileIssue's reactivation branch does.
+	s.SetStatus(StatusActive)
+	s.SetFailureMode("")
+	s.SetPRURL("")
+	s.SetCurrentFindings(nil)
+	s.SetCurrentPendingChecks(nil)
+	s.SetNoDiffIterationCount(0)
+
+	ctx := WithActor(t.Context(), testActor)
+	ctx = WithTrigger(ctx, TriggerReactivated)
+	changed, err := mgr.Save(ctx, s)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed: got = false, want = true (reactivation must persist)")
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if saved.Status != StatusActive {
+		t.Errorf("Status: got = %q, want = %q", saved.Status, StatusActive)
+	}
+	if saved.FailureMode != "" {
+		t.Errorf("FailureMode: got = %q, want = empty", saved.FailureMode)
+	}
+	if saved.PRURL != "" {
+		t.Errorf("PRURL: got = %q, want = empty", saved.PRURL)
+	}
+	if len(saved.CurrentFindings) != 0 {
+		t.Errorf("CurrentFindings: got = %+v, want = nil/empty", saved.CurrentFindings)
+	}
+	if len(saved.CurrentPendingChecks) != 0 {
+		t.Errorf("CurrentPendingChecks: got = %+v, want = nil/empty", saved.CurrentPendingChecks)
+	}
+	if got, want := saved.GetNoDiffIterationCount(), 0; got != want {
+		t.Errorf("NoDiffIterationCount: got = %d, want = %d", got, want)
+	}
+	// Failed→Active transition must append a History entry recording the
+	// reactivation trigger so operators can audit who/when reactivated.
+	if got, want := len(saved.History), 1; got != want {
+		t.Fatalf("History len: got = %d, want = %d", got, want)
+	}
+	entry := saved.History[0]
+	if entry.From != StatusFailed || entry.To != StatusActive {
+		t.Errorf("History[0] from/to: got = %q→%q, want = %q→%q", entry.From, entry.To, StatusFailed, StatusActive)
+	}
+	if entry.Trigger != TriggerReactivated {
+		t.Errorf("History[0].Trigger: got = %q, want = %q", entry.Trigger, TriggerReactivated)
+	}
+	if entry.Mode != "" {
+		t.Errorf("History[0].Mode: got = %q, want = empty (transition out of Failed clears mode)", entry.Mode)
+	}
+}
+
+// TestGateApplyReactivationReset_PredicateAndPersist exercises the
+// gateApplyReactivationReset helper directly with each terminal failure
+// mode. Locks in two contracts:
+//
+//  1. Predicate: only Failed/PRClosed triggers the reset. Failed/NoDiff
+//     and Failed/NoProgress (which don't auto-cancel Linear) must NOT
+//     reset, because the human reactivating Linear gives no new signal —
+//     re-running would just reproduce the same no-op.
+//  2. Persist: when the reset fires, the cleared fields land on the
+//     Linear attachment so the next mgr.Load below the gate sees the
+//     fresh state.
+//
+// Catches refactor regressions on the gate predicate (else-if chain at
+// the top of reconcileIssue) without needing a full reconcileIssue mock
+// chain — the harder e2e form is intentionally skipped because driving
+// changeSession + github clients + agent for a one-line predicate would
+// be net-negative for the test suite's signal-to-noise ratio.
+func TestGateApplyReactivationReset_PredicateAndPersist(t *testing.T) {
+	tests := []struct {
+		name           string
+		initial        string
+		wantApplied    bool
+		wantStatusOut  Status
+		wantModeOut    FailureMode
+		wantPRURLOut   string
+		wantHistoryOut bool
+	}{
+		{
+			name:           "PRClosed triggers reset",
+			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"pr_closed","current_findings":[{"kind":"ciCheck","identifier":"job-1"}],"current_pending_checks":["build"],"no_diff_iteration_count":2}`,
+			wantApplied:    true,
+			wantStatusOut:  StatusActive,
+			wantModeOut:    "",
+			wantPRURLOut:   "",
+			wantHistoryOut: true,
+		},
+		{
+			name:           "NoDiff does not trigger reset",
+			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_diff"}`,
+			wantApplied:    false,
+			wantStatusOut:  StatusFailed,
+			wantModeOut:    FailureModeNoDiff,
+			wantPRURLOut:   "https://github.com/o/r/pull/1",
+			wantHistoryOut: false,
+		},
+		{
+			name:           "NoProgress does not trigger reset",
+			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"failed","failure_mode":"no_progress"}`,
+			wantApplied:    false,
+			wantStatusOut:  StatusFailed,
+			wantModeOut:    FailureModeNoProgress,
+			wantPRURLOut:   "https://github.com/o/r/pull/1",
+			wantHistoryOut: false,
+		},
+		{
+			name:           "Active status does not trigger reset",
+			initial:        `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`,
+			wantApplied:    false,
+			wantStatusOut:  StatusActive,
+			wantModeOut:    "",
+			wantPRURLOut:   "https://github.com/o/r/pull/1",
+			wantHistoryOut: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLinearStateFixture(t, tc.initial)
+			r := newReconcilerForFixture(t, f)
+			mgr := r.NewStateManager(f.issue)
+
+			s, _, err := mgr.Load(t.Context())
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+
+			got := r.gateApplyReactivationReset(t.Context(), mgr, s)
+			if got != tc.wantApplied {
+				t.Errorf("gateApplyReactivationReset returned: got = %v, want = %v", got, tc.wantApplied)
+			}
+
+			// When the reset fires, verify it landed on the Linear
+			// attachment (not just on the in-memory `s`).
+			if tc.wantApplied {
+				var saved State
+				loadSavedState(t, f, &saved)
+				if saved.Status != tc.wantStatusOut {
+					t.Errorf("persisted Status: got = %q, want = %q", saved.Status, tc.wantStatusOut)
+				}
+				if saved.FailureMode != tc.wantModeOut {
+					t.Errorf("persisted FailureMode: got = %q, want = %q", saved.FailureMode, tc.wantModeOut)
+				}
+				if saved.PRURL != tc.wantPRURLOut {
+					t.Errorf("persisted PRURL: got = %q, want = %q", saved.PRURL, tc.wantPRURLOut)
+				}
+				if len(saved.CurrentFindings) != 0 {
+					t.Errorf("persisted CurrentFindings: got = %+v, want = empty", saved.CurrentFindings)
+				}
+				if len(saved.CurrentPendingChecks) != 0 {
+					t.Errorf("persisted CurrentPendingChecks: got = %+v, want = empty", saved.CurrentPendingChecks)
+				}
+				if got, want := saved.GetNoDiffIterationCount(), 0; got != want {
+					t.Errorf("persisted NoDiffIterationCount: got = %d, want = %d", got, want)
+				}
+				if tc.wantHistoryOut {
+					if got, want := len(saved.History), 1; got != want {
+						t.Fatalf("History len: got = %d, want = %d", got, want)
+					}
+					if saved.History[0].Trigger != TriggerReactivated {
+						t.Errorf("History[0].Trigger: got = %q, want = %q", saved.History[0].Trigger, TriggerReactivated)
+					}
+				}
+			} else {
+				// Predicate didn't fire — the in-memory state must be
+				// untouched (no Save call should have happened).
+				if got := f.saveCount.Load(); got != 0 {
+					t.Errorf("Save count when predicate didn't fire: got = %d, want = 0", got)
+				}
+			}
+		})
+	}
+}
+
+// TestStateManager_NotifyProgress_FiresCallback verifies the in-flight
+// notification path delivers a marshaled state snapshot to the configured
+// callback without writing the Linear attachment. This is the
+// downstream-freshness primitive used before multi-minute agent runs.
+func TestStateManager_NotifyProgress_FiresCallback(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+
+	var (
+		gotIssueID string
+		gotJSON    []byte
+	)
+	mgr := r.NewStateManager(f.issue).SetSaveCallback(func(_ context.Context, issueID string, stateJSON []byte) {
+		gotIssueID = issueID
+		gotJSON = append([]byte(nil), stateJSON...)
+	})
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if err := mgr.NotifyProgress(t.Context(), s); err != nil {
+		t.Fatalf("NotifyProgress: %v", err)
+	}
+
+	if gotIssueID != f.issue.ID {
+		t.Errorf("callback issueID: got = %q, want = %q", gotIssueID, f.issue.ID)
+	}
+	if len(gotJSON) == 0 {
+		t.Fatal("callback received empty JSON")
+	}
+	var seen State
+	if err := json.Unmarshal(gotJSON, &seen); err != nil {
+		t.Fatalf("unmarshal callback JSON: %v", err)
+	}
+	if seen.Status != StatusActive {
+		t.Errorf("callback Status: got = %q, want = %q", seen.Status, StatusActive)
+	}
+	// Linear must NOT be written — that's the whole point of NotifyProgress
+	// vs Save (avoids amplifying the duplicate-attachment race).
+	if got := f.saveCount.Load(); got != 0 {
+		t.Errorf("Linear save count after NotifyProgress: got = %d, want = 0", got)
+	}
+}
+
+// TestStateManager_NotifyProgress_NoCallbackIsNoOp verifies NotifyProgress
+// returns cleanly when no callback is configured (e.g., bot didn't opt into
+// downstream mirroring). Important so framework code can call it
+// unconditionally.
+func TestStateManager_NotifyProgress_NoCallbackIsNoOp(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	// Deliberately do NOT call SetSaveCallback.
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if err := mgr.NotifyProgress(t.Context(), s); err != nil {
+		t.Fatalf("NotifyProgress with no callback: got error %v, want nil", err)
+	}
+	if got := f.saveCount.Load(); got != 0 {
+		t.Errorf("Linear save count: got = %d, want = 0", got)
+	}
+}
+
+// TestStateManager_NotifyProgress_DoesNotRefreshSnapshot verifies a subsequent
+// Save still sees the original load-time snapshot for its dirty check, so
+// changes that happened after Load (and were mirrored via NotifyProgress)
+// still trip the dirty check and persist to Linear at end-of-reconcile.
+func TestStateManager_NotifyProgress_DoesNotRefreshSnapshot(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue).SetSaveCallback(func(context.Context, string, []byte) {})
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Mutate findings (a change the dirty check covers) then NotifyProgress.
+	wantFindings := []FindingRef{{Kind: "ciCheck", Identifier: "job-1"}}
+	s.SetCurrentFindings(wantFindings)
+	if err := mgr.NotifyProgress(t.Context(), s); err != nil {
+		t.Fatalf("NotifyProgress: %v", err)
+	}
+	if got := f.saveCount.Load(); got != 0 {
+		t.Fatalf("Linear save count after NotifyProgress: got = %d, want = 0", got)
+	}
+
+	// Now Save with the same mutated state. If NotifyProgress had refreshed
+	// the snapshot, the dirty check would see findings as unchanged and
+	// skip the Linear write — a regression that would silently mute
+	// end-of-reconcile persistence.
+	changed, err := mgr.Save(t.Context(), s)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !changed {
+		t.Fatalf("Save changed: got = false, want = true (NotifyProgress must not refresh the snapshot)")
+	}
+	if got := f.saveCount.Load(); got != 1 {
+		t.Errorf("Linear save count after Save: got = %d, want = 1", got)
+	}
+}
+
+// TestStateManager_NoDiffIterationCountPersist verifies that the
+// consecutive-no-diff counter round-trips through Save/Load. Critical because
+// the cap that fires FailureModeNoProgress relies on the counter accumulating
+// across reconciles — if Linear's persisted state drops the field, every new
+// reconcile starts from zero and the cap never trips.
+func TestStateManager_NoDiffIterationCountPersist(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+	mgr := r.NewStateManager(f.issue)
+
+	s, _, err := mgr.Load(t.Context())
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	s.SetNoDiffIterationCount(2)
+
+	changed, err := mgr.Save(t.Context(), s)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if !changed {
+		t.Fatalf("changed: got = false, want = true (counter change must persist)")
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got, want := saved.GetNoDiffIterationCount(), 2; got != want {
+		t.Errorf("NoDiffIterationCount: got = %d, want = %d", got, want)
+	}
+
+	// Same-value re-save is a no-op: snapshot refresh after the previous save
+	// means the counter doesn't look dirty this time.
+	noopChanged, err := mgr.Save(t.Context(), s)
+	if err != nil {
+		t.Fatalf("no-op Save: %v", err)
+	}
+	if noopChanged {
+		t.Errorf("no-op changed: got = true, want = false (same counter must not re-write)")
+	}
+}
+
+// TestSaveNoDiffIterationState_IncrementsCounter verifies the no-diff path
+// increments the counter from 0 → 1 on the first call without flipping the
+// state machine.
+func TestSaveNoDiffIterationState_IncrementsCounter(t *testing.T) {
+	f := newLinearStateFixture(t, `{"pr_url":"https://github.com/o/r/pull/1","status":"active"}`)
+	r := newReconcilerForFixture(t, f)
+
+	if err := r.saveNoDiffIterationState(t.Context(), f.issue, nil, nil, TriggerCIFailureIteration); err != nil {
+		t.Fatalf("saveNoDiffIterationState: %v", err)
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got, want := saved.GetNoDiffIterationCount(), 1; got != want {
+		t.Errorf("NoDiffIterationCount: got = %d, want = %d", got, want)
+	}
+	if saved.Status != StatusActive {
+		t.Errorf("Status: got = %q, want = %q (must not flip below cap)", saved.Status, StatusActive)
+	}
+	if saved.FailureMode != "" {
+		t.Errorf("FailureMode: got = %q, want = empty (must not set below cap)", saved.FailureMode)
+	}
+}
+
+// TestSaveNoDiffIterationState_TransitionsAtCap verifies the no-diff path
+// transitions to StatusFailed + FailureModeNoProgress when the counter
+// reaches maxNoDiffIterations. Seeded with one less than the cap so a single
+// invocation crosses the threshold.
+func TestSaveNoDiffIterationState_TransitionsAtCap(t *testing.T) {
+	initial := fmt.Sprintf(`{"pr_url":"https://github.com/o/r/pull/1","status":"active","no_diff_iteration_count":%d}`, maxNoDiffIterations-1)
+	f := newLinearStateFixture(t, initial)
+	r := newReconcilerForFixture(t, f)
+
+	if err := r.saveNoDiffIterationState(t.Context(), f.issue, nil, nil, TriggerCIFailureIteration); err != nil {
+		t.Fatalf("saveNoDiffIterationState: %v", err)
+	}
+
+	var saved State
+	loadSavedState(t, f, &saved)
+	if got, want := saved.GetNoDiffIterationCount(), maxNoDiffIterations; got != want {
+		t.Errorf("NoDiffIterationCount: got = %d, want = %d", got, want)
+	}
+	if saved.Status != StatusFailed {
+		t.Errorf("Status: got = %q, want = %q", saved.Status, StatusFailed)
+	}
+	if saved.FailureMode != FailureModeNoProgress {
+		t.Errorf("FailureMode: got = %q, want = %q", saved.FailureMode, FailureModeNoProgress)
+	}
+	if got, want := len(saved.History), 1; got != want {
+		t.Fatalf("History len: got = %d, want = %d (cap-induced transition must append a History entry)", got, want)
+	}
+	entry := saved.History[0]
+	if entry.To != StatusFailed || entry.Mode != FailureModeNoProgress {
+		t.Errorf("History[0] to/mode: got = %q/%q, want = %q/%q", entry.To, entry.Mode, StatusFailed, FailureModeNoProgress)
+	}
+	if entry.Trigger != TriggerNoProgress {
+		t.Errorf("History[0].Trigger: got = %q, want = %q (cap-induced transition must override the originating trigger)", entry.Trigger, TriggerNoProgress)
+	}
+}
+
 // TestStateManager_FailureModeReclassification verifies a Failed→Failed
 // transition with a different FailureMode persists the new mode.
 func TestStateManager_FailureModeReclassification(t *testing.T) {

@@ -10,6 +10,8 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"chainguard.dev/driftlessaf/agents/toolcall/callbacks"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
@@ -52,21 +54,44 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		return nil
 	}
 
-	// Terminal-state gate: if the bot already transitioned this issue to
-	// StatusFailed + FailureModeNoDiff, skip reconcile entirely. The agent
-	// has already decided no work is needed; running it again produces the
-	// same no-op, which would post a duplicate Linear comment AND burn
-	// agent inference. Operators who want to re-trigger should clear the
-	// state attachment manually (or post a new task — a future change
-	// could gate on description-hash deltas to allow auto-reset on edit).
+	// State-based gates: handle two failure modes that were terminal at the
+	// time they were recorded, but whose semantics depend on whether the
+	// human has since reactivated the Linear issue (which we already
+	// confirmed above is non-terminal).
+	//
+	//   - FailureModePRClosed: a bot SaveCallback that observed a closed
+	//     PR transitioned the issue here (and may have used
+	//     SetIssueStateByType to canceled the Linear issue too). The human
+	//     moving Linear back off canceled is an explicit "keep going"
+	//     signal, so reset the terminal markers + drop the stale PRURL/
+	//     findings/pending so the next reconcile cycle re-engages with a
+	//     fresh PR. Without this, downstream consumers reading State
+	//     would render the issue as terminally cancelled indefinitely
+	//     even though the human's intent is the opposite.
+	//
+	//   - FailureModeNoDiff / FailureModeNoProgress: bot decided no work
+	//     was possible (initial-run no-diff or K-iteration no-progress).
+	//     These don't auto-cancel Linear, so the human reactivating
+	//     doesn't tell us anything new — re-running would just reproduce
+	//     the same no-op. Operators clear State manually to retry, same
+	//     escape hatch the framework already documents.
 	gateMgr := r.NewStateManager(issue)
-	if existing, loaded, err := gateMgr.Load(ctx); err != nil {
+	existing, loaded, gateLoadErr := gateMgr.Load(ctx)
+	// if-else chain (rather than switch) is deliberate: existing/loaded need
+	// function scope so the findings-delta dedup at the HasFindings branch
+	// below can reference them. A switch would scope them to the switch.
+	//nolint:gocritic // ifElseChain: see comment above
+	if gateLoadErr != nil {
 		// Don't fail-closed on transient Load errors — fall through and
 		// let the rest of reconcile run, where state mutations have their
 		// own retry behaviour.
-		clog.WarnContext(ctx, "Skipping no_diff terminal-state gate: load failed", "error", err)
-	} else if loaded && existing.GetStatus() == StatusFailed && existing.GetFailureMode() == FailureModeNoDiff {
-		clog.InfoContext(ctx, "Skipping reconcile: previously transitioned to no_diff (terminal). Clear state to retry.")
+		clog.WarnContext(ctx, "Skipping state-based gates: load failed", "error", gateLoadErr)
+	} else if loaded && r.gateApplyReactivationReset(ctx, gateMgr, existing) {
+		// Reset fired; fall through to the rest of reconcile so a fresh PR
+		// gets created on the now-cleared state.
+	} else if loaded && existing.GetStatus() == StatusFailed &&
+		(existing.GetFailureMode() == FailureModeNoDiff || existing.GetFailureMode() == FailureModeNoProgress) {
+		clog.InfoContextf(ctx, "Skipping reconcile: previously transitioned to %s (terminal). Clear state to retry.", existing.GetFailureMode())
 		return nil
 	}
 
@@ -150,7 +175,46 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		return err
 
 	case state.HasFindings():
-		clog.InfoContext(ctx, "PR has CI findings, iterating", "findings", len(changeSession.Findings()))
+		// Findings-delta dedup: when the live finding set is identical to
+		// what we last saw and persisted, the agent has already iterated
+		// against this exact set of failures. Re-running it would burn
+		// inference reproducing whatever it produced last time (commit or
+		// no-diff). Webhook chatter on a stuck PR — success/neutral
+		// check_run completions, label edits, reviewer activity — would
+		// otherwise re-fire HasFindings on every event because the
+		// level-based switch sees the lingering failures regardless of
+		// which event triggered the reconcile.
+		//
+		// Skipping routes through saveNoDiffIterationState: it persists
+		// the live findings/pending snapshot (no-op since they match the
+		// existing record), increments the no-diff counter, and at
+		// maxNoDiffIterations transitions to FailureModeNoProgress —
+		// same backstop as a real no-diff agent run. The dedup is
+		// strictly a cost optimisation; correctness still flows through
+		// the existing terminal-state machinery.
+		//
+		// We only skip when the issue Description hash also matches the
+		// hash embedded in PRData on the open PR. A human editing the
+		// description while CI is failing is the documented signal for
+		// redirecting the agent (Upsert.needsRefresh in
+		// changemanager/session.go normally fires on this), and pre-PR
+		// we always reached Upsert from this branch. Without the hash
+		// gate, the dedup would silently swallow that redirect AND tick
+		// the no-progress counter toward FailureModeNoProgress.
+		liveFindings := snapshotFindings(changeSession.Findings())
+		if loaded && len(existing.GetCurrentFindings()) > 0 && findingsEqual(liveFindings, existing.GetCurrentFindings()) {
+			descChanged, derr := descriptionHashChanged(changeSession, issue)
+			switch {
+			case derr != nil:
+				clog.WarnContext(ctx, "Findings dedup: description-hash check failed; falling through to agent run to be safe", "error", derr)
+			case !descChanged:
+				clog.InfoContext(ctx, "Findings unchanged and description unchanged; skipping agent run", "findings", len(liveFindings))
+				return r.saveNoDiffIterationState(ctx, issue, liveFindings, changeSession.PendingChecks(), TriggerCIFailureIteration)
+			default:
+				clog.InfoContext(ctx, "Findings unchanged but issue description was edited; iterating to honour description redirect", "findings", len(liveFindings))
+			}
+		}
+		clog.InfoContext(ctx, "PR has CI findings, iterating", "findings", len(liveFindings))
 		usePRBranch = true
 		trigger = TriggerCIFailureIteration
 
@@ -253,6 +317,28 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 			agentCtx := WithLinearIssueID(ctx, issue.ID)
 			agentCtx = WithTrigger(agentCtx, trigger)
 
+			// Push an in-flight state snapshot to the downstream mirror BEFORE
+			// the multi-minute agent run so post-save observers see the
+			// agent has engaged (any wrapper-derived Phase computed by the
+			// bot's trigger-driven BeforeSave updates immediately) while
+			// the agent works, rather than the previous reconcile's stale
+			// snapshot. NotifyProgress writes only the callback mirror — no
+			// Linear attachment write — so this doesn't amplify the
+			// duplicate-attachment race in linearreconciler/state.go.
+			// Errors are logged but non-fatal: this is observability only,
+			// never a gate on the agent. A transient Load failure here
+			// commonly means a momentary GCS hiccup that the end-of-
+			// reconcile Save will recover from; the rare case where it
+			// signals deeper Linear connectivity (and the final Save fails
+			// too) is already covered by the retriable-error path on the
+			// outer workqueue dispatch.
+			progressMgr := r.NewStateManager(issue)
+			if progressState, _, perr := progressMgr.Load(agentCtx); perr != nil {
+				clog.WarnContext(agentCtx, "In-flight progress notification: load failed (continuing with agent run)", "error", perr)
+			} else if perr := progressMgr.NotifyProgress(agentCtx, progressState); perr != nil {
+				clog.WarnContext(agentCtx, "In-flight progress notification failed (continuing with agent run)", "error", perr)
+			}
+
 			agentRan = true
 			result, err := r.agent.Execute(agentCtx, request, cbs)
 			if err != nil {
@@ -352,6 +438,11 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 		s.SetCurrentFindings(newFindings)
 	}
 	s.SetCurrentPendingChecks(changeSession.PendingChecks())
+	// Agent ran and produced a diff (else we'd have hit the ErrNoChanges
+	// branch above). Reset the no-progress counter so subsequent no-diff
+	// iterations on this PR get a fresh K-attempt budget against a
+	// different commit base.
+	s.SetNoDiffIterationCount(0)
 
 	ctx = WithActor(ctx, r.identity)
 	ctx = WithTrigger(ctx, trigger)
@@ -378,6 +469,51 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) reconcileIssue(ctx context.Context, i
 // issue knows what happened. Called from reconcileIssue when Upsert
 // returns changemanager.ErrNoChanges.
 //
+// gateApplyReactivationReset clears Failed/PRClosed terminal markers when
+// a human has reactivated a Linear issue (the early non-terminal-state
+// guard at the top of reconcileIssue ensures we only get here when Linear
+// is non-terminal). Returns true if the reset was applied; false otherwise.
+//
+// Predicate is intentionally narrow: only Failed/PRClosed warrants reset
+// because the other terminal failure modes (NoDiff, NoProgress) don't
+// auto-cancel Linear, so a human reactivating Linear gives no new signal —
+// re-running would just reproduce the same no-op. Operators clear State
+// manually to retry those, same escape hatch the framework already
+// documents.
+//
+// Persist failure is logged but non-fatal: downstream consumers will keep
+// showing the previous terminal state until the next reconcile retries
+// the reset, but the human's intent is captured in Linear's workflow
+// state, and the cleared-but-unsaved State here is local to this gateMgr
+// only — the next mgr.Load below will re-read whatever Linear has.
+//
+// Extracted from inline gate-stage code so the predicate is unit-testable
+// without scaffolding a full reconcileIssue mock chain.
+func (r *Reconciler[Req, Resp, CB, T, PT]) gateApplyReactivationReset(ctx context.Context, gateMgr *StateManager[T, PT], existing PT) bool {
+	if existing.GetStatus() != StatusFailed || existing.GetFailureMode() != FailureModePRClosed {
+		return false
+	}
+	clog.InfoContext(ctx, "Human reactivated Linear issue; clearing PR-closed terminal markers so the next reconcile starts fresh")
+	existing.SetStatus(StatusActive)
+	existing.SetFailureMode("")
+	// Drop the stale PRURL so the switch in reconcileIssue hits the
+	// !state.HasPR branch and creates a new PR. The closed PR's CI
+	// findings/pending are no longer relevant — clear those too so
+	// downstream consumers don't see stale failures while the new PR is
+	// being constructed. The no-diff counter belongs to the closed PR's
+	// iteration history; reset it for the fresh attempt.
+	existing.SetPRURL("")
+	existing.SetCurrentFindings(nil)
+	existing.SetCurrentPendingChecks(nil)
+	existing.SetNoDiffIterationCount(0)
+	rctx := WithActor(ctx, r.identity)
+	rctx = WithTrigger(rctx, TriggerReactivated)
+	if _, err := gateMgr.Save(rctx, existing); err != nil {
+		clog.WarnContext(ctx, "Failed to persist reactivation reset; downstream consumers may stay stale until next reconcile", "error", err)
+	}
+	return true
+}
+
 // Returns nil so the workqueue does not retry — the agent has already
 // decided the issue needs no work, and the same call would reproduce
 // the same no-op. The TriggerDescriptionEditIteration path re-enters
@@ -440,14 +576,86 @@ func snapshotFindings(findings []callbacks.Finding) []FindingRef {
 	return out
 }
 
+// findingsEqual reports whether two FindingRef snapshots represent the same
+// set of findings. The comparison is order-insensitive — GitHub doesn't
+// guarantee a stable ordering across reconciles, so the inputs are sorted
+// by (Kind, Identifier) before slices.Equal compares all fields.
+//
+// Strict by design: a check_run that re-runs gets a new GitHub job ID
+// (Identifier), which makes it a different finding here. That intentionally
+// fires the agent on retry rather than treating a flaky-then-failing-again
+// check as "unchanged" — the alternative (matching by Name+Kind only)
+// would mask matrix-job partial failures where the same Name fails on a
+// different shard.
+//
+// Both inputs nil/empty returns true. Pure function so it's trivially
+// testable independent of the rest of reconcileIssue.
+func findingsEqual(a, b []FindingRef) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	if len(a) == 0 {
+		return true
+	}
+	aSorted := slices.Clone(a)
+	bSorted := slices.Clone(b)
+	cmp := func(x, y FindingRef) int {
+		if c := strings.Compare(x.Kind, y.Kind); c != 0 {
+			return c
+		}
+		return strings.Compare(x.Identifier, y.Identifier)
+	}
+	slices.SortFunc(aSorted, cmp)
+	slices.SortFunc(bSorted, cmp)
+	return slices.Equal(aSorted, bSorted)
+}
+
+// descriptionHashChanged reports whether the issue's current description
+// differs from the DescriptionHash embedded in PRData on the open PR.
+//
+// Returns false (and a nil error) when there is no open PR to compare
+// against, or when the PRData marker can't be extracted — the
+// findings-dedup path callers treat both as "no signal of a description
+// edit," and Upsert.needsRefresh remains the canonical fallback for
+// detecting redirects when we do reach it on subsequent reconciles.
+//
+// Returns a non-nil error only on cryptographic failure (which can't
+// happen for sha256.Sum256 in practice). Callers fall through to a real
+// agent run on any error to be safe rather than silently swallowing the
+// human's redirect.
+func descriptionHashChanged[Req any](changeSession *changemanager.Session[PRData[Req]], issue *linearreconciler.Issue) (bool, error) {
+	existingData, err := changeSession.Extract()
+	if err != nil {
+		return false, fmt.Errorf("extract PRData: %w", err)
+	}
+	if existingData == nil {
+		return false, nil
+	}
+	currentHash := sha256.Sum256([]byte(issue.Description))
+	return currentHash != existingData.DescriptionHash, nil
+}
+
+// maxNoDiffIterations is the cap on consecutive no-diff iterations against
+// the same PR before the framework gives up and transitions the issue to
+// StatusFailed + FailureModeNoProgress. Hardcoded rather than configurable
+// because the value isn't tuning-sensitive: the loop the cap exists to break
+// is dominated by webhook bursts on stuck PRs, not by legitimate iteration
+// patterns. Bumpable in a follow-up if real-world data warrants.
+const maxNoDiffIterations = 3
+
 // saveNoDiffIterationState persists the live findings/pending snapshot the
 // agent just observed when it iterated on an existing PR but produced no
-// further changes. Status and PRURL are intentionally untouched (the PR is
-// still valid and active). The trigger argument is the trigger that drove
-// this iteration (TriggerCIFailureIteration / TriggerDescriptionEditIteration
-// / TriggerMergeConflict) and is threaded through context so bot wrappers'
+// further changes, increments the no-diff iteration counter, and transitions
+// to StatusFailed + FailureModeNoProgress when the counter reaches the cap.
+// Status and PRURL are otherwise untouched (the PR is still valid and active).
+//
+// The trigger argument is the trigger that drove this iteration
+// (TriggerCIFailureIteration / TriggerDescriptionEditIteration /
+// TriggerMergeConflict) and is threaded through context so bot wrappers'
 // BeforeSave hooks see "agent did engage this reconcile" and refresh
-// LastIterationAt + Phase accordingly.
+// LastIterationAt + Phase accordingly. When the cap-induced transition fires,
+// the trigger is overridden to TriggerNoProgress so the History entry reflects
+// the framework decision rather than the originating webhook.
 //
 // Findings/pending changes alone do NOT trigger a Linear attachment write
 // (the dirty check covers Status/FailureMode/PRURL only), but the post-save
@@ -455,7 +663,9 @@ func snapshotFindings(findings []callbacks.Finding) []FindingRef {
 // observation. Without this save, downstream consumers would see the stale
 // pre-iteration snapshot — typically empty findings from the initial-run
 // save before CI had even started — even though the framework just spent
-// minutes iterating on real CI failures.
+// minutes iterating on real CI failures. The cap-induced Status/FailureMode
+// transition does flip the dirty check, so the cap save is always persisted
+// to Linear.
 func (r *Reconciler[Req, Resp, CB, T, PT]) saveNoDiffIterationState(ctx context.Context, issue *linearreconciler.Issue, findings []FindingRef, pendingChecks []string, trigger string) error {
 	mgr := r.NewStateManager(issue)
 	s, _, err := mgr.Load(ctx)
@@ -469,6 +679,16 @@ func (r *Reconciler[Req, Resp, CB, T, PT]) saveNoDiffIterationState(ctx context.
 		s.SetCurrentFindings(findings)
 	}
 	s.SetCurrentPendingChecks(pendingChecks)
+
+	next := s.GetNoDiffIterationCount() + 1
+	s.SetNoDiffIterationCount(next)
+	if next >= maxNoDiffIterations {
+		s.SetStatus(StatusFailed)
+		s.SetFailureMode(FailureModeNoProgress)
+		trigger = TriggerNoProgress
+		clog.InfoContextf(ctx, "Agent produced no diff on %d consecutive iterations; transitioning to no_progress failure mode", next)
+	}
+
 	ctx = WithActor(ctx, r.identity)
 	ctx = WithTrigger(ctx, trigger)
 	if _, err := mgr.Save(ctx, s); err != nil {

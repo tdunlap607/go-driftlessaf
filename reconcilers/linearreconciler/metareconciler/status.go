@@ -46,6 +46,12 @@ const (
 	// editing the issue description, which the framework picks up via
 	// TriggerDescriptionEditIteration.
 	FailureModeNoDiff FailureMode = "no_diff"
+	// FailureModeNoProgress means the agent has produced no diff on
+	// maxNoDiffIterations consecutive iterations of the same PR. The
+	// framework gives up so it doesn't burn agent inference re-trying a
+	// stuck PR on every check_run webhook. Operators clear State to retry,
+	// same escape hatch as FailureModeNoDiff.
+	FailureModeNoProgress FailureMode = "no_progress"
 )
 
 // Trigger values the framework records on State.History entries.
@@ -83,6 +89,16 @@ const (
 	// FailureModeNoDiff. The agent's intended commit message is captured
 	// on the StateTransition's Note field for operator visibility.
 	TriggerNoDiff = "no_diff"
+	// TriggerNoProgress is the trigger recorded when the no-diff iteration
+	// counter reaches maxNoDiffIterations and the issue transitions to
+	// StatusFailed + FailureModeNoProgress.
+	TriggerNoProgress = "no_progress"
+	// TriggerReactivated is the trigger recorded when a human moves a
+	// previously-canceled Linear issue back to a non-terminal workflow
+	// state and the framework clears the StatusFailed + FailureModePRClosed
+	// markers so the bot can re-engage. Only fires for the PRClosed flavour
+	// of canceled — NoDiff and NoProgress remain operator-cleared.
+	TriggerReactivated = "reactivated"
 )
 
 // State is the framework's persistent state-machine record for a single
@@ -109,6 +125,20 @@ type State struct {
 	History              []StateTransition `json:"history,omitempty"`
 	CurrentFindings      []FindingRef      `json:"current_findings,omitempty"`
 	CurrentPendingChecks []string          `json:"current_pending_checks,omitempty"`
+	// NoDiffIterationCount is the number of consecutive iterations on the
+	// current PR where the agent ran but produced no diff. Reset to 0 on
+	// any iteration that produces a commit. When it reaches
+	// maxNoDiffIterations, the reconciler transitions to StatusFailed +
+	// FailureModeNoProgress. Cleared implicitly when an operator resets
+	// State to retry (the whole attachment is replaced).
+	//
+	// jsonschema:"minimum=0" is a hint to schema generators that the
+	// framework only ever sets this counter to non-negative values; a
+	// negative value at rest indicates corruption (manual mis-edit,
+	// downstream-store byte-mangling) and downstream consumers can
+	// schema-validate to surface it. The framework itself doesn't
+	// import jsonschema; the tag is purely metadata.
+	NoDiffIterationCount int `json:"no_diff_iteration_count,omitempty" jsonschema:"minimum=0"`
 }
 
 // pendingChecksCap bounds the persisted CurrentPendingChecks list to
@@ -207,6 +237,15 @@ func (s *State) SetCurrentPendingChecks(p []string) {
 	s.CurrentPendingChecks = clone
 }
 
+// GetNoDiffIterationCount returns the current consecutive-no-diff counter.
+// Part of the StateMachine interface.
+func (s *State) GetNoDiffIterationCount() int { return s.NoDiffIterationCount }
+
+// SetNoDiffIterationCount sets the consecutive-no-diff counter. Part of the
+// StateMachine interface. The framework increments on each no-diff iteration
+// and resets to 0 on any iteration that produces a commit.
+func (s *State) SetNoDiffIterationCount(n int) { s.NoDiffIterationCount = n }
+
 // SetFailureMode sets the FailureMode. Part of the StateMachine interface.
 func (s *State) SetFailureMode(fm FailureMode) { s.FailureMode = fm }
 
@@ -237,8 +276,14 @@ func (s *State) GetHistory() []StateTransition { return s.History }
 
 // BeforeSave is called by StateManager.Save immediately before each persist,
 // after the framework has set its own fields (Status, PRURL, IssueID/URL)
-// and before the dirty check. The default implementation is a no-op
-// returning false.
+// and before the dirty check. It is also invoked by StateManager.NotifyProgress
+// (without a Linear write) so in-flight callback snapshots carry the same
+// derived fields downstream consumers see on persisted snapshots. As a
+// result a single reconcile path may invoke BeforeSave multiple times on
+// distinct State instances — implementations MUST be idempotent and pure
+// derivation (no counter increments, no resource allocation, no side
+// effects beyond setting wrapper-specific fields). The default
+// implementation is a no-op returning false.
 //
 // Bots that add wrapper-specific fields to their embedded-State struct can
 // shadow this method on their wrapper to populate those fields from
@@ -285,6 +330,13 @@ type StateMachine interface {
 	SetCurrentFindings([]FindingRef)
 	GetCurrentPendingChecks() []string
 	SetCurrentPendingChecks([]string)
+	// GetNoDiffIterationCount / SetNoDiffIterationCount expose the
+	// consecutive-no-diff counter. The framework increments on each no-diff
+	// iteration and resets to 0 on any iteration that produces a commit;
+	// when the counter reaches maxNoDiffIterations the reconciler
+	// transitions to StatusFailed + FailureModeNoProgress.
+	GetNoDiffIterationCount() int
+	SetNoDiffIterationCount(int)
 	// SetIssueID and SetIssueURL are called by StateManager.Save before
 	// every persist, with values captured from the *Issue at
 	// NewStateManager time. Bots never call these themselves — when a
@@ -293,10 +345,14 @@ type StateMachine interface {
 	SetIssueID(string)
 	SetIssueURL(string)
 	// BeforeSave is called by StateManager.Save immediately before each
-	// persist; bots populate wrapper-specific fields here. The default
-	// no-op on State is satisfied automatically via embedding; bots that
-	// need custom behavior shadow it on their wrapper. See State.BeforeSave
-	// for return-value semantics.
+	// persist AND by StateManager.NotifyProgress before each callback-only
+	// snapshot push, so a single reconcile path may invoke it multiple
+	// times on distinct State instances. Bots populate wrapper-specific
+	// fields here; implementations MUST be idempotent and free of side
+	// effects beyond setting those fields. The default no-op on State is
+	// satisfied automatically via embedding; bots that need custom behavior
+	// shadow it on their wrapper. See State.BeforeSave for return-value
+	// semantics and the idempotency contract.
 	BeforeSave(context.Context) bool
 }
 

@@ -57,6 +57,7 @@ type StateManager[T any, PT StateConstraint[T]] struct {
 	snapshotPRURL         string
 	snapshotFindings      []FindingRef
 	snapshotPendingChecks []string
+	snapshotNoDiffCount   int
 	loaded                bool
 	now                   func() time.Time // injectable clock for tests
 	cb                    SaveCallback
@@ -145,6 +146,7 @@ func (m *StateManager[T, PT]) Load(ctx context.Context) (PT, bool, error) {
 	// mutates the State's slices in-place (vs. wholesale Set replacement).
 	m.snapshotFindings = slices.Clone(pt.GetCurrentFindings())
 	m.snapshotPendingChecks = slices.Clone(pt.GetCurrentPendingChecks())
+	m.snapshotNoDiffCount = pt.GetNoDiffIterationCount()
 	m.loaded = loaded
 	return pt, loaded, nil
 }
@@ -211,11 +213,13 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	currentPRURL := pt.GetPRURL()
 	currentFindings := pt.GetCurrentFindings()
 	currentPendingChecks := pt.GetCurrentPendingChecks()
+	currentNoDiffCount := pt.GetNoDiffIterationCount()
 
 	statusOrModeChanged := currentStatus != m.snapshotStatus || currentFailureMode != m.snapshotFailureMode
 	prURLChanged := currentPRURL != m.snapshotPRURL
 	findingsChanged := !slices.Equal(currentFindings, m.snapshotFindings)
 	pendingChecksChanged := !slices.Equal(currentPendingChecks, m.snapshotPendingChecks)
+	noDiffCountChanged := currentNoDiffCount != m.snapshotNoDiffCount
 
 	// Persist to Linear when any tracked field changed, when the bot opted
 	// in via BeforeSave, OR when we never loaded (first save creates the
@@ -229,7 +233,7 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 	// PRURL-only and findings/pending-only changes save without a History
 	// append — a from==to entry would mislead observability — but the
 	// fields themselves must persist so consumers see current state.
-	linearDirty := statusOrModeChanged || prURLChanged || findingsChanged || pendingChecksChanged || botForcedDirty || !m.loaded
+	linearDirty := statusOrModeChanged || prURLChanged || findingsChanged || pendingChecksChanged || noDiffCountChanged || botForcedDirty || !m.loaded
 
 	if statusOrModeChanged {
 		actor, _ := ActorFromContext(ctx)
@@ -288,10 +292,46 @@ func (m *StateManager[T, PT]) Save(ctx context.Context, pt PT) (bool, error) {
 		// independent of any in-place mutation a bot might do later.
 		m.snapshotFindings = slices.Clone(currentFindings)
 		m.snapshotPendingChecks = slices.Clone(currentPendingChecks)
+		m.snapshotNoDiffCount = currentNoDiffCount
 		m.loaded = true
 	}
 
 	return linearDirty, nil
+}
+
+// NotifyProgress fires the post-save callback with a fresh JSON snapshot of
+// pt without writing the Linear attachment. Use this from inside long-running
+// reconcile paths (e.g., before invoking a multi-minute agent run) to push
+// in-flight state to downstream mirrors so post-save observers reflect that
+// the bot is engaged rather than the previous reconcile's stale snapshot.
+//
+// Differences from Save:
+//
+//   - No Linear attachment write (avoids amplifying the duplicate-attachment
+//     race in linearreconciler/state.go for what is fundamentally an
+//     observability update).
+//   - No History append (no state-machine transition occurred).
+//   - Snapshot fields are NOT refreshed, so the next Save's dirty check still
+//     compares against the load-time snapshot.
+//   - BeforeSave IS invoked — bots that derive observability fields from
+//     trigger context (LastIterationAt, Phase) get them populated on the
+//     mirrored snapshot.
+//
+// No-op when no callback is configured. Marshal failures log a warning and
+// return nil — the caller's primary work (the agent run) must not be blocked
+// by a downstream mirror hiccup.
+func (m *StateManager[T, PT]) NotifyProgress(ctx context.Context, pt PT) error {
+	if m.cb == nil {
+		return nil
+	}
+	pt.BeforeSave(ctx)
+	stateJSON, err := json.Marshal(pt)
+	if err != nil {
+		clog.WarnContext(ctx, "NotifyProgress skipped: marshal failed", "error", err)
+		return nil
+	}
+	m.cb(ctx, m.issueID, stateJSON)
+	return nil
 }
 
 // UpsertBotComment passes through to the underlying StateManager. Exposed
