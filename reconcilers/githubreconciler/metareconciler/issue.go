@@ -8,9 +8,11 @@ package metareconciler
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler"
+	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/changemanager"
 	"chainguard.dev/driftlessaf/reconcilers/githubreconciler/clonemanager"
 	"github.com/chainguard-dev/clog"
 	gogit "github.com/go-git/go-git/v5"
@@ -132,7 +134,7 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, res *git
 		}()
 
 		// Run the agent and push changes
-		return lease.MakeAndPushChanges(ctx, branchName, func(ctx context.Context, _ *gogit.Worktree) (string, error) {
+		return lease.MakeAndPushChanges(ctx, branchName, func(ctx context.Context, wt *gogit.Worktree) (string, error) {
 			cbs, err := r.buildCallbacks(ctx, changeSession, lease)
 			if err != nil {
 				return "", fmt.Errorf("build callbacks: %w", err)
@@ -142,10 +144,25 @@ func (r *Reconciler[Req, Resp, CB]) reconcileIssue(ctx context.Context, res *git
 			if err != nil {
 				return "", fmt.Errorf("execute agent: %w", err)
 			}
+
+			// Check if the agent left the worktree clean (no file changes).
+			// Return ErrNoChanges so Upsert can propagate it to the caller.
+			status, err := wt.Status()
+			if err != nil {
+				return "", fmt.Errorf("get worktree status: %w", err)
+			}
+			if status.IsClean() {
+				return "", changemanager.ErrNoChanges
+			}
+
 			return result.GetCommitMessage(), nil
 		})
 	})
 	if err != nil {
+		if errors.Is(err, changemanager.ErrNoChanges) {
+			log.Info("No changes after agent execution, nothing to commit")
+			return nil
+		}
 		return fmt.Errorf("upsert PR: %w", err)
 	}
 
