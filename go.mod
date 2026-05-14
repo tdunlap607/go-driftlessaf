@@ -1,6 +1,6 @@
 module chainguard.dev/driftlessaf
 
-go 1.25.8
+go 1.26.2
 
 require (
 	chainguard.dev/apko v1.2.9
@@ -8,12 +8,12 @@ require (
 	chainguard.dev/sdk v0.1.54
 	cloud.google.com/go/aiplatform v1.121.0
 	cloud.google.com/go/compute/metadata v0.9.0
-	cloud.google.com/go/kms v1.29.0
+	cloud.google.com/go/kms v1.30.0
 	cloud.google.com/go/storage v1.62.1
 	github.com/anthropics/anthropic-sdk-go v1.37.0
 	github.com/bradleyfalzon/ghinstallation/v2 v2.18.0
 	github.com/chainguard-dev/clog v1.8.0
-	github.com/chainguard-dev/terraform-infra-common v1.0.2
+	github.com/chainguard-dev/terraform-infra-common v1.0.5
 	github.com/chainguard-dev/terraform-provider-cosign v0.3.4
 	github.com/cloudevents/sdk-go/v2 v2.16.2
 	github.com/coreos/go-oidc/v3 v3.18.0
@@ -26,7 +26,7 @@ require (
 	github.com/grpc-ecosystem/go-grpc-middleware/v2 v2.3.3
 	github.com/in-toto/in-toto-golang v0.11.0
 	github.com/invopop/jsonschema v0.14.0
-	github.com/octo-sts/app v0.6.0
+	github.com/octo-sts/app v0.7.1
 	github.com/olekukonko/tablewriter v1.1.4
 	github.com/openai/openai-go v1.12.0
 	github.com/prometheus/client_golang v1.23.2
@@ -51,7 +51,7 @@ require (
 	google.golang.org/api v0.278.0
 	google.golang.org/genai v1.36.0
 	google.golang.org/grpc v1.81.0
-	google.golang.org/protobuf v1.36.11
+	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -227,7 +227,7 @@ require (
 	github.com/sassoftware/relic v7.2.1+incompatible // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
-	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
+	github.com/shirou/gopsutil/v4 v4.26.4 // indirect
 	github.com/shurcooL/graphql v0.0.0-20230722043721-ed46e5a46466 // indirect
 	github.com/sigstore/protobuf-specs v0.5.1 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.2.1 // indirect

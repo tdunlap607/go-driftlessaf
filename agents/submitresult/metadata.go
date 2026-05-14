@@ -49,8 +49,7 @@ func extractMetadata(t reflect.Type) (tagMetadata, bool) {
 		return meta, false
 	}
 
-	for i := range t.NumField() {
-		field := t.Field(i)
+	for field := range t.Fields() {
 		tag := field.Tag.Get(tagKey)
 		if tag == "" {
 			continue

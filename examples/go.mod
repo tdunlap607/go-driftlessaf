@@ -1,6 +1,6 @@
 module chainguard.dev/driftlessaf/examples
 
-go 1.25.8
+go 1.26.2
 
 require (
 	chainguard.dev/driftlessaf v0.0.0
@@ -18,7 +18,7 @@ require (
 	cloud.google.com/go/auth v0.20.0 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/iam v1.7.0 // indirect
-	cloud.google.com/go/kms v1.29.0 // indirect
+	cloud.google.com/go/kms v1.30.0 // indirect
 	cloud.google.com/go/longrunning v0.9.0 // indirect
 	cloud.google.com/go/profiler v0.6.0 // indirect
 	cloud.google.com/go/trace v1.11.7 // indirect
@@ -62,7 +62,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/chainguard-dev/terraform-infra-common v1.0.2 // indirect
+	github.com/chainguard-dev/terraform-infra-common v1.0.5 // indirect
 	github.com/cloudevents/sdk-go/v2 v2.16.2 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/containerd/stargz-snapshotter/estargz v0.18.2 // indirect
@@ -160,7 +160,7 @@ require (
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/natefinch/atomic v1.0.1 // indirect
 	github.com/nozzle/throttler v0.0.0-20180817012639-2ea982251481 // indirect
-	github.com/octo-sts/app v0.6.0 // indirect
+	github.com/octo-sts/app v0.7.1 // indirect
 	github.com/oklog/ulid/v2 v2.1.1 // indirect
 	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
@@ -181,7 +181,7 @@ require (
 	github.com/sergi/go-diff v1.4.0 // indirect
 	github.com/sethvargo/go-envconfig v1.3.0 // indirect
 	github.com/shibumi/go-pathspec v1.3.0 // indirect
-	github.com/shirou/gopsutil/v4 v4.26.3 // indirect
+	github.com/shirou/gopsutil/v4 v4.26.4 // indirect
 	github.com/shurcooL/githubv4 v0.0.0-20240727222349-48295856cce7 // indirect
 	github.com/shurcooL/graphql v0.0.0-20230722043721-ed46e5a46466 // indirect
 	github.com/sigstore/cosign/v3 v3.0.6 // indirect
@@ -253,7 +253,7 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260427160629-7cedc36a6bc4 // indirect
 	google.golang.org/grpc v1.81.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/klog/v2 v2.130.1 // indirect
