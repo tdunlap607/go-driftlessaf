@@ -32,10 +32,32 @@ func NewGoldenEval[T any](j Interface, criterion string, goldenAnswer string, ca
 			return
 		}
 
-		// Get judgment with ByCode tracer injected (allows caller to specify evals for the judge itself, but alternate purpose is to quiet default logging during tests)
-		// Start with background context but preserve ExecutionContext from trace for metrics labeling
-		ctx := agenttrace.WithTracer(context.Background(), agenttrace.ByCode(callbacks...))
-		ctx = agenttrace.WithExecutionContext(ctx, trace.ExecContext)
+		// Derive from the trace's own ctx so the judge inherits the reconciler's
+		// WithDefaultNameFn ("autofix: pr:...", "skillup: ...", "manifest-gen: ..."),
+		// WithDefaultAgentName, WithPayloadsEnabled, and the active OTel span
+		// parent. Without this, every judge-emitted invoke_agent span surfaces as
+		// an orphan root named "judge" with no link to the parent trace tree; any
+		// outbound HTTP call inside the judge similarly becomes an orphan root
+		// (e.g. "HTTP POST" from otelhttp instrumentation) because it has no
+		// active OTel span to parent under.
+		//
+		// context.WithoutCancel detaches the cancellation chain: callbacks fire
+		// after Complete(), so the original request's ctx may already be Done.
+		// We want to inherit the values (Default*, ExecContext, the OTel span
+		// for parentage) without inheriting the deadline. Available since Go 1.21.
+		//
+		// Fall back to Background() when trace.Context() is nil: tests construct
+		// Trace[T] as a struct literal (bypassing newTrace) and never set ctx.
+		// Production code always goes through newTrace, which seeds ctx.
+		//
+		// WithTracer overrides only the in-process tracer chain so judge evals
+		// don't recurse back through the parent tracer's callbacks.
+		parentCtx := trace.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx := context.WithoutCancel(parentCtx)
+		ctx = agenttrace.WithTracer(ctx, agenttrace.ByCode(callbacks...))
 		resp, err := j.Judge(ctx, &Request{
 			Mode:            GoldenMode,
 			ReferenceAnswer: goldenAnswer,
@@ -80,10 +102,32 @@ func NewStandaloneEval[T any](j Interface, criterion string, callbacks ...agentt
 			return
 		}
 
-		// Get judgment with ByCode tracer injected (allows caller to specify evals for the judge itself, but alternate purpose is to quiet default logging during tests)
-		// Start with background context but preserve ExecutionContext from trace for metrics labeling
-		ctx := agenttrace.WithTracer(context.Background(), agenttrace.ByCode(callbacks...))
-		ctx = agenttrace.WithExecutionContext(ctx, trace.ExecContext)
+		// Derive from the trace's own ctx so the judge inherits the reconciler's
+		// WithDefaultNameFn ("autofix: pr:...", "skillup: ...", "manifest-gen: ..."),
+		// WithDefaultAgentName, WithPayloadsEnabled, and the active OTel span
+		// parent. Without this, every judge-emitted invoke_agent span surfaces as
+		// an orphan root named "judge" with no link to the parent trace tree; any
+		// outbound HTTP call inside the judge similarly becomes an orphan root
+		// (e.g. "HTTP POST" from otelhttp instrumentation) because it has no
+		// active OTel span to parent under.
+		//
+		// context.WithoutCancel detaches the cancellation chain: callbacks fire
+		// after Complete(), so the original request's ctx may already be Done.
+		// We want to inherit the values (Default*, ExecContext, the OTel span
+		// for parentage) without inheriting the deadline. Available since Go 1.21.
+		//
+		// Fall back to Background() when trace.Context() is nil: tests construct
+		// Trace[T] as a struct literal (bypassing newTrace) and never set ctx.
+		// Production code always goes through newTrace, which seeds ctx.
+		//
+		// WithTracer overrides only the in-process tracer chain so judge evals
+		// don't recurse back through the parent tracer's callbacks.
+		parentCtx := trace.Context()
+		if parentCtx == nil {
+			parentCtx = context.Background()
+		}
+		ctx := context.WithoutCancel(parentCtx)
+		ctx = agenttrace.WithTracer(ctx, agenttrace.ByCode(callbacks...))
 		resp, err := j.Judge(ctx, &Request{
 			Mode:         StandaloneMode,
 			ActualAnswer: string(data),

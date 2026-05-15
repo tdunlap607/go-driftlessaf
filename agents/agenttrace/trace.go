@@ -293,6 +293,21 @@ func truncatePayload(s string) (string, bool) {
 	return s[:maxPayloadBytes], true
 }
 
+// Context returns the context the trace was created with. Eval callbacks
+// run after Complete() and historically derived from context.Background()
+// to detach from any cancellation/deadline on the original request, but
+// that also dropped the reconciler's WithDefaultNameFn / WithDefaultAgentName
+// / WithPayloadsEnabled, causing every eval-emitted trace (e.g. judge) to
+// surface as an orphan root span with no link to the parent trace tree.
+// Callbacks should wrap the returned ctx with context.WithoutCancel before
+// kicking off long-lived work so they inherit the reconciler-set values
+// without inheriting the completed request's cancellation.
+func (t *Trace[T]) Context() context.Context {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ctx
+}
+
 // BeginTurn starts a new LLM turn span as a child of the trace span.
 // The trace context is updated so subsequent tool call spans are nested under
 // this turn span. Call End() on the returned LLMTurn when the turn completes.
