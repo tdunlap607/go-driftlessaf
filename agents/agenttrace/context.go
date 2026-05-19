@@ -92,9 +92,26 @@ const (
 	payloadsEnabledKey  contextKey = "payloads_enabled"
 )
 
-// WithExecutionContext adds execution context to the Go context
+// WithExecutionContext layers non-zero fields from execCtx onto any
+// ExecutionContext already on ctx. Zero-valued fields leave the existing value
+// intact, so a deep call site that only owns TurnNumber can update it without
+// clobbering ReconcilerKey/ReconcilerType/CommitSHA set by the enclosing
+// reconciler. Pass a fully-populated struct to set all fields at once.
 func WithExecutionContext(ctx context.Context, execCtx ExecutionContext) context.Context {
-	return context.WithValue(ctx, executionContextKey, execCtx)
+	merged := GetExecutionContext(ctx)
+	if execCtx.ReconcilerKey != "" {
+		merged.ReconcilerKey = execCtx.ReconcilerKey
+	}
+	if execCtx.ReconcilerType != "" {
+		merged.ReconcilerType = execCtx.ReconcilerType
+	}
+	if execCtx.CommitSHA != "" {
+		merged.CommitSHA = execCtx.CommitSHA
+	}
+	if execCtx.TurnNumber != 0 {
+		merged.TurnNumber = execCtx.TurnNumber
+	}
+	return context.WithValue(ctx, executionContextKey, merged)
 }
 
 // GetExecutionContext retrieves execution context from the Go context

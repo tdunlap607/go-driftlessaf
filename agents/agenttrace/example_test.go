@@ -41,3 +41,21 @@ func ExampleWithExecutionContext() {
 	fmt.Printf("key=%s turn=%d\n", ec.ReconcilerKey, ec.TurnNumber)
 	// Output: key=pr:chainguard-dev/enterprise-packages/42 turn=1
 }
+
+// ExampleWithExecutionContext_partial demonstrates the merge-on-non-zero
+// semantics: a deep call site that only knows about TurnNumber updates it
+// without clobbering ReconcilerKey, ReconcilerType, or CommitSHA set by the
+// enclosing reconciler.
+func ExampleWithExecutionContext_partial() {
+	ctx := agenttrace.WithExecutionContext(context.Background(), agenttrace.ExecutionContext{
+		ReconcilerKey:  "pr:chainguard-dev/mono/40044",
+		ReconcilerType: "pr",
+		CommitSHA:      "abc123",
+	})
+
+	ctx = agenttrace.WithExecutionContext(ctx, agenttrace.ExecutionContext{TurnNumber: 3})
+
+	ec := agenttrace.GetExecutionContext(ctx)
+	fmt.Printf("key=%s sha=%s turn=%d\n", ec.ReconcilerKey, ec.CommitSHA, ec.TurnNumber)
+	// Output: key=pr:chainguard-dev/mono/40044 sha=abc123 turn=3
+}
