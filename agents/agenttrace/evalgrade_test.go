@@ -99,16 +99,15 @@ func driveAgentTrace[T any](t *testing.T, ctx context.Context, spanName, system,
 }
 
 // TestPayloadsEnabled verifies that when WithPayloadsEnabled(ctx, true) is
-// set, the root invoke_agent span carries both the Langfuse-compatible and
-// Braintrust / OTel-semconv-compatible payload attribute pairs and the
-// agent name / dynamic name labels; and that the turn span carries
-// gen_ai.system alongside gen_ai.request.model + per-call token usage.
-// gen_ai.usage.* token attrs and tokens.* / model custom attrs MUST NOT
-// appear on the root span — per OTel GenAI semconv they belong on the
-// per-call "chat <model>" span, not the orchestration invoke_agent span.
-// Langfuse otherwise reclassifies the root span as a generation observation
-// and double-counts cost. The absence falls out of the whole-map comparison
-// for free.
+// set, the root invoke_agent span carries both OTel-semconv variants of the
+// payload attributes (gen_ai.prompt + gen_ai.input.messages,
+// gen_ai.completion + gen_ai.output.messages) and the agent name / dynamic
+// invocation label; and that the turn span carries gen_ai.system alongside
+// gen_ai.request.model + per-call token usage. gen_ai.usage.* token attrs
+// and tokens.* / model custom attrs MUST NOT appear on the root span —
+// per OTel GenAI semconv they belong on the per-call "chat <model>" span,
+// not the orchestration invoke_agent span. The absence falls out of the
+// whole-map comparison for free.
 func TestPayloadsEnabled(t *testing.T) {
 	sr := setupRecorder(t)
 
@@ -125,16 +124,16 @@ func TestPayloadsEnabled(t *testing.T) {
 	}
 
 	wantRoot := map[string]any{
-		"agent.prompt":                    "analyze these logs",
-		"gen_ai.operation.name":           "invoke_agent",
-		"gen_ai.agent.name":               "loganalyzer",
-		"braintrust.span_attributes.name": "autofix: pr:chainguard-dev/mono/38632",
-		"reconciler_key":                  "pr:chainguard-dev/mono/38632",
-		"reconciler_type":                 "pr",
-		"gen_ai.prompt":                   present{},
-		"gen_ai.input.messages":           present{},
-		"gen_ai.completion":               present{},
-		"gen_ai.output.messages":          present{},
+		"agent.prompt":                 "analyze these logs",
+		"gen_ai.operation.name":        "invoke_agent",
+		"gen_ai.agent.name":            "loganalyzer",
+		"driftlessaf.invocation.label": "autofix: pr:chainguard-dev/mono/38632",
+		"reconciler_key":               "pr:chainguard-dev/mono/38632",
+		"reconciler_type":              "pr",
+		"gen_ai.prompt":                present{},
+		"gen_ai.input.messages":        present{},
+		"gen_ai.completion":            present{},
+		"gen_ai.output.messages":       present{},
 	}
 	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
 		t.Errorf("root attrs (-want +got):\n%s", diff)
@@ -159,7 +158,7 @@ func TestPayloadsEnabled(t *testing.T) {
 
 // TestPayloadsDisabled verifies that with no WithPayloadsEnabled opt-in on
 // the ctx, the root span has no prompt/completion payload attributes,
-// only the agent name and Braintrust name. As in TestPayloadsEnabled,
+// only the agent name and the invocation label. As in TestPayloadsEnabled,
 // no token usage attrs land on the root — token usage is per-call and
 // belongs on the turn span. Absence of the payload keys and the token
 // attrs falls out of the whole-map comparison.
@@ -179,12 +178,12 @@ func TestPayloadsDisabled(t *testing.T) {
 	}
 
 	wantRoot := map[string]any{
-		"agent.prompt":                    "analyze these logs",
-		"gen_ai.operation.name":           "invoke_agent",
-		"gen_ai.agent.name":               "loganalyzer",
-		"braintrust.span_attributes.name": "autofix: pr:chainguard-dev/mono/38632",
-		"reconciler_key":                  "pr:chainguard-dev/mono/38632",
-		"reconciler_type":                 "pr",
+		"agent.prompt":                 "analyze these logs",
+		"gen_ai.operation.name":        "invoke_agent",
+		"gen_ai.agent.name":            "loganalyzer",
+		"driftlessaf.invocation.label": "autofix: pr:chainguard-dev/mono/38632",
+		"reconciler_key":               "pr:chainguard-dev/mono/38632",
+		"reconciler_type":              "pr",
 	}
 	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
 		t.Errorf("root attrs (-want +got):\n%s", diff)
@@ -209,7 +208,7 @@ func TestPayloadsDisabled(t *testing.T) {
 
 // TestTruncation verifies that a prompt larger than maxPayloadBytes is
 // truncated before being emitted as gen_ai.prompt / gen_ai.input.messages,
-// and that braintrust.metadata.truncated=true is stamped to signal the
+// and that driftlessaf.payload.truncated=true is stamped to signal the
 // truncation to the backend.
 func TestTruncation(t *testing.T) {
 	sr := setupRecorder(t)
@@ -237,14 +236,14 @@ func TestTruncation(t *testing.T) {
 		t.Errorf("gen_ai.input.messages length = %d; want <= %d", got, maxPayloadBytes)
 	}
 
-	trunc := findAttr(root, "braintrust.metadata.truncated")
+	trunc := findAttr(root, "driftlessaf.payload.truncated")
 	if trunc == nil || !trunc.Value.AsBool() {
-		t.Error("root: braintrust.metadata.truncated != true after truncation")
+		t.Error("root: driftlessaf.payload.truncated != true after truncation")
 	}
 }
 
 // TestNameFnNil verifies that when no nameFn is supplied the
-// braintrust.span_attributes.name attribute falls back to the agent name.
+// driftlessaf.invocation.label attribute falls back to the agent name.
 func TestNameFnNil(t *testing.T) {
 	sr := setupRecorder(t)
 
@@ -257,12 +256,12 @@ func TestNameFnNil(t *testing.T) {
 	if root == nil {
 		t.Fatal("root invoke_agent span not found")
 	}
-	kv := findAttr(root, "braintrust.span_attributes.name")
+	kv := findAttr(root, "driftlessaf.invocation.label")
 	if kv == nil {
-		t.Fatal("root: missing braintrust.span_attributes.name")
+		t.Fatal("root: missing driftlessaf.invocation.label")
 	}
 	if got, want := kv.Value.AsString(), "loganalyzer"; got != want {
-		t.Errorf("braintrust.span_attributes.name: got %q, want %q", got, want)
+		t.Errorf("driftlessaf.invocation.label: got %q, want %q", got, want)
 	}
 }
 
@@ -292,11 +291,11 @@ func TestDefaultAgentNameFromContext(t *testing.T) {
 		t.Fatalf("root invoke_agent span not found; got %d spans", len(spans))
 	}
 	wantRoot := map[string]any{
-		"agent.prompt":                    "prompt",
-		"gen_ai.operation.name":           "invoke_agent",
-		"gen_ai.agent.name":               "judge",
-		"braintrust.span_attributes.name": "autofix: pr:foo/bar/1",
-		"reconciler_key":                  "pr:foo/bar/1",
+		"agent.prompt":                 "prompt",
+		"gen_ai.operation.name":        "invoke_agent",
+		"gen_ai.agent.name":            "judge",
+		"driftlessaf.invocation.label": "autofix: pr:foo/bar/1",
+		"reconciler_key":               "pr:foo/bar/1",
 	}
 	if diff := cmp.Diff(wantRoot, attrsAsMap(root), anyValue); diff != "" {
 		t.Errorf("root attrs (-want +got):\n%s", diff)

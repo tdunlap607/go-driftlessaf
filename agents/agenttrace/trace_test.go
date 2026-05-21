@@ -500,7 +500,7 @@ func TestLLMTurnRecoveryAfterError(t *testing.T) {
 }
 
 // Fail must mark the turn span as Error so OTEL backends (Cloud Trace, Tempo,
-// Langfuse) light up the failure — parity with ToolCall.Complete and
+// Jaeger, etc.) light up the failure — parity with ToolCall.Complete and
 // Trace.complete which both set codes.Error on the wrapped span. RecordError,
 // in contrast, must NOT set status (it represents recoverable events) — only
 // the exception event lands on the span.

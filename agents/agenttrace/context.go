@@ -144,9 +144,9 @@ func GetDefaultAgentName(ctx context.Context) string {
 }
 
 // WithDefaultNameFn returns a context carrying a name function invoked by
-// newTrace to build the braintrust.span_attributes.name attribute from the
+// newTrace to build the driftlessaf.invocation.label attribute from the
 // ExecutionContext. Callers at the reconciler layer (where the GitHub
-// Resource is available) use this to stamp PR-aware labels such as
+// Resource is available) use this to stamp resource-aware labels such as
 // "autofix: pr:chainguard-dev/mono#38632" on every subsequent trace.
 func WithDefaultNameFn(ctx context.Context, fn func(ExecutionContext) string) context.Context {
 	return context.WithValue(ctx, nameFnKey, fn)

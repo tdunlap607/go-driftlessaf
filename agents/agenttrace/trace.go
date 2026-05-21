@@ -22,15 +22,15 @@ import (
 )
 
 // maxPayloadBytes is the maximum byte length for a payload attribute emitted
-// on the root invoke_agent span. Both Braintrust and Langfuse ingest reject
-// ~1 MB+ batches, so fixer prompts / completions that exceed this get
-// truncated with a braintrust.metadata.truncated=true marker.
+// on the root invoke_agent span. Most OTLP ingest endpoints reject ~1 MB+
+// batches, so fixer prompts / completions that exceed this get truncated
+// with a driftlessaf.payload.truncated=true marker.
 const maxPayloadBytes = 64 * 1024
 
 // Canonical gen_ai.system values per the OpenTelemetry GenAI semantic
 // conventions. Executors pass these to BeginTurn so downstream eval tools
-// (Braintrust, Langfuse, …) can filter traces by provider without
-// consumers needing to remember the exact spelling.
+// can filter traces by provider without consumers needing to remember the
+// exact spelling.
 const (
 	SystemAnthropic    = "anthropic"
 	SystemGoogleVertex = "google.vertex"
@@ -39,7 +39,7 @@ const (
 
 // StartTraceOption configures trace creation. Options let callers attach
 // an agent name (static, for gen_ai.agent.name) and a dynamic name function
-// (for braintrust.span_attributes.name — e.g. "autofix: pr:chainguard-dev/mono#38632").
+// (for driftlessaf.invocation.label — e.g. "autofix: pr:chainguard-dev/mono#38632").
 type StartTraceOption func(*traceOptions)
 
 type traceOptions struct {
@@ -49,16 +49,20 @@ type traceOptions struct {
 
 // WithAgentName sets the static gen_ai.agent.name attribute on the root
 // invoke_agent span (e.g. "loganalyzer", "judge", "fixer"). Also used as
-// the fallback for braintrust.span_attributes.name when no nameFn is set.
+// the fallback for driftlessaf.invocation.label when no nameFn is set.
 func WithAgentName(name string) StartTraceOption {
 	return func(o *traceOptions) {
 		o.agentName = name
 	}
 }
 
-// WithNameFn sets a callback that produces the braintrust.span_attributes.name
-// attribute (the label shown in the Braintrust UI) from the ExecutionContext.
-// When nil or unset, braintrust.span_attributes.name falls back to agentName.
+// WithNameFn sets a callback that produces the driftlessaf.invocation.label
+// attribute — a per-invocation, free-form label (e.g.
+// "autofix: pr:chainguard-dev/mono#38632") computed from the
+// ExecutionContext. Vendor-neutral; backends that want to use this as the
+// primary trace name (Braintrust, Langfuse, etc.) bridge it in user-side
+// span processors. When nil or unset, driftlessaf.invocation.label falls
+// back to agentName.
 func WithNameFn(fn func(ExecutionContext) string) StartTraceOption {
 	return func(o *traceOptions) {
 		o.nameFn = fn
@@ -200,14 +204,13 @@ func newTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOptio
 	tr := otel.Tracer("chainguard.ai.agents.agenttrace",
 		oteltrace.WithInstrumentationVersion("1.0.0"))
 
-	// Compute the Braintrust-facing span name. braintrust.span_attributes.name
-	// drives the label in the Braintrust UI. nameFn wins for PR-aware labels
-	// ("autofix: pr:chainguard-dev/mono#38632"); otherwise fall back to the
-	// static agent name.
-	btName := o.agentName
+	// Compute the per-invocation label emitted as driftlessaf.invocation.label.
+	// nameFn wins for resource-aware labels ("autofix: pr:chainguard-dev/mono#38632");
+	// otherwise fall back to the static agent name.
+	invocationLabel := o.agentName
 	if o.nameFn != nil {
 		if n := o.nameFn(execCtx); n != "" {
-			btName = n
+			invocationLabel = n
 		}
 	}
 
@@ -224,8 +227,8 @@ func newTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOptio
 	if o.agentName != "" {
 		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("gen_ai.agent.name", o.agentName)))
 	}
-	if btName != "" {
-		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("braintrust.span_attributes.name", btName)))
+	if invocationLabel != "" {
+		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("driftlessaf.invocation.label", invocationLabel)))
 	}
 	if execCtx.ReconcilerKey != "" {
 		spanAttrs = append(spanAttrs, oteltrace.WithAttributes(attribute.String("reconciler_key", execCtx.ReconcilerKey)))
@@ -240,9 +243,9 @@ func newTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOptio
 	// Payload emission (gen_ai.prompt + gen_ai.input.messages) is gated on
 	// the WithPayloadsEnabled ctx opt-in. Staging can opt in; prod stays off
 	// pending security review because prompts may contain build-log tokens
-	// and internal URLs. Dual-emit both the Langfuse-compatible (gen_ai.prompt)
-	// and Braintrust / OTel-semconv-compatible (gen_ai.input.messages) keys
-	// so either backend picks up the payload with zero code revisit.
+	// and internal URLs. Both gen_ai.prompt and gen_ai.input.messages are
+	// emitted so backends that read either OTel-semconv variant of the
+	// payload attribute pick it up.
 	if payloadsEnabledFrom(ctx) && prompt != "" {
 		if payload, err := json.Marshal([]map[string]string{{"role": "user", "content": prompt}}); err == nil {
 			payloadStr, truncated := truncatePayload(string(payload))
@@ -252,7 +255,7 @@ func newTrace[T any](ctx context.Context, prompt string, opts ...StartTraceOptio
 			))
 			if truncated {
 				spanAttrs = append(spanAttrs, oteltrace.WithAttributes(
-					attribute.Bool("braintrust.metadata.truncated", true),
+					attribute.Bool("driftlessaf.payload.truncated", true),
 				))
 			}
 		}
@@ -605,10 +608,10 @@ func (t *Trace[T]) complete(result T, err error) {
 
 	if span != nil {
 		// Emit the final result payload on the root invoke_agent span before
-		// ending it. Dual-emit both the Langfuse-compatible (gen_ai.completion)
-		// and Braintrust / OTel-semconv-compatible (gen_ai.output.messages)
-		// keys so either backend auto-populates the output field. Gated on
-		// the WithPayloadsEnabled ctx opt-in — same reasoning as prompt emission.
+		// ending it. Both gen_ai.completion and gen_ai.output.messages are
+		// emitted so backends that read either OTel-semconv variant of the
+		// payload attribute pick it up. Gated on the WithPayloadsEnabled
+		// ctx opt-in — same reasoning as prompt emission.
 		if payloadsEnabledFrom(t.ctx) && err == nil {
 			if payload, mErr := json.Marshal(result); mErr == nil && len(payload) > 0 && string(payload) != "null" {
 				payloadStr, truncated := truncatePayload(string(payload))
@@ -617,7 +620,7 @@ func (t *Trace[T]) complete(result T, err error) {
 					attribute.String("gen_ai.output.messages", payloadStr),
 				)
 				if truncated {
-					span.SetAttributes(attribute.Bool("braintrust.metadata.truncated", true))
+					span.SetAttributes(attribute.Bool("driftlessaf.payload.truncated", true))
 				}
 			}
 		}
