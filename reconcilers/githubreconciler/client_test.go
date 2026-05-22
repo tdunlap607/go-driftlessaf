@@ -28,6 +28,19 @@ func (m *mockTokenSource) Token() (*oauth2.Token, error) {
 	}, nil
 }
 
+type contextCheckingTokenSource struct {
+	ctx context.Context
+}
+
+func (c *contextCheckingTokenSource) Token() (*oauth2.Token, error) {
+	if err := c.ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &oauth2.Token{
+		AccessToken: "token",
+	}, nil
+}
+
 func TestClientCache_Get(t *testing.T) {
 	ctx := t.Context()
 
@@ -126,6 +139,84 @@ func TestClientCache_GetError(t *testing.T) {
 
 	if !errors.Is(err, expectedErr) {
 		t.Errorf("Expected error to contain %v, got %v", expectedErr, err)
+	}
+}
+
+func TestClientCache_TokenSourceFor(t *testing.T) {
+	ctx := t.Context()
+	var tokenSourceCalls atomic.Int32
+
+	tokenSourceFunc := func(_ context.Context, org, repo string) (oauth2.TokenSource, error) {
+		tokenSourceCalls.Add(1)
+		return &mockTokenSource{token: fmt.Sprintf("token-%s-%s", org, repo)}, nil
+	}
+
+	cache := NewClientCache(tokenSourceFunc)
+
+	tokenSource1, err := cache.TokenSourceFor(ctx, "org", "repo")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+	tokenSource2, err := cache.TokenSourceFor(ctx, "org", "repo")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+	if tokenSource1 != tokenSource2 {
+		t.Fatal("expected same token source for same org/repo")
+	}
+
+	tokenSource3, err := cache.TokenSourceFor(ctx, "org", "other")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+	if tokenSource1 == tokenSource3 {
+		t.Fatal("expected different token source for different repo")
+	}
+
+	if got := tokenSourceCalls.Load(); got != 2 {
+		t.Fatalf("token source calls: got = %d, want = 2", got)
+	}
+}
+
+func TestClientCache_GetReusesTokenSourceCache(t *testing.T) {
+	ctx := t.Context()
+	var tokenSourceCalls atomic.Int32
+
+	tokenSourceFunc := func(_ context.Context, org, repo string) (oauth2.TokenSource, error) {
+		tokenSourceCalls.Add(1)
+		return &mockTokenSource{token: fmt.Sprintf("token-%s-%s", org, repo)}, nil
+	}
+
+	cache := NewClientCache(tokenSourceFunc)
+
+	if _, err := cache.TokenSourceFor(ctx, "org", "repo"); err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+	if _, err := cache.Get(ctx, "org", "repo"); err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+
+	if got := tokenSourceCalls.Load(); got != 1 {
+		t.Fatalf("token source calls: got = %d, want = 1", got)
+	}
+}
+
+func TestClientCache_TokenSourceForDoesNotCaptureCallerContext(t *testing.T) {
+	tokenSourceFunc := func(ctx context.Context, _, _ string) (oauth2.TokenSource, error) {
+		return &contextCheckingTokenSource{ctx: ctx}, nil
+	}
+
+	cache := NewClientCache(tokenSourceFunc)
+	ctx, cancel := context.WithCancel(t.Context())
+	tokenSource, err := cache.TokenSourceFor(ctx, "org", "repo")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+
+	cancel()
+
+	if _, err := tokenSource.Token(); err != nil {
+		t.Fatalf("token source captured caller context: %v", err)
 	}
 }
 
@@ -229,6 +320,38 @@ func TestClientCache_Clear(t *testing.T) {
 	calls := tokenSourceCalls.Load()
 	if calls != 2 {
 		t.Errorf("Expected token source to be called twice, but was called %d times", calls)
+	}
+}
+
+func TestClientCache_ClearTokenSources(t *testing.T) {
+	ctx := t.Context()
+	var tokenSourceCalls atomic.Int32
+
+	tokenSourceFunc := func(_ context.Context, org, repo string) (oauth2.TokenSource, error) {
+		tokenSourceCalls.Add(1)
+		return &mockTokenSource{token: fmt.Sprintf("token-%s-%s", org, repo)}, nil
+	}
+
+	cache := NewClientCache(tokenSourceFunc)
+
+	tokenSource1, err := cache.TokenSourceFor(ctx, "org", "repo")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+
+	cache.Clear()
+
+	tokenSource2, err := cache.TokenSourceFor(ctx, "org", "repo")
+	if err != nil {
+		t.Fatalf("TokenSourceFor: %v", err)
+	}
+
+	if tokenSource1 == tokenSource2 {
+		t.Fatal("expected different token source instances after Clear")
+	}
+
+	if got := tokenSourceCalls.Load(); got != 2 {
+		t.Fatalf("token source calls: got = %d, want = 2", got)
 	}
 }
 

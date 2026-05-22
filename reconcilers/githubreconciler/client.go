@@ -25,6 +25,7 @@ type ClientCache struct {
 	tokenSourceFunc TokenSourceFunc
 	mu              sync.RWMutex
 	clients         map[string]*github.Client
+	tokenSources    map[string]oauth2.TokenSource
 }
 
 // NewClientCache creates a new client cache with the provided token source function.
@@ -32,6 +33,7 @@ func NewClientCache(tokenSourceFunc TokenSourceFunc) *ClientCache {
 	return &ClientCache{
 		tokenSourceFunc: tokenSourceFunc,
 		clients:         make(map[string]*github.Client),
+		tokenSources:    make(map[string]oauth2.TokenSource),
 	}
 }
 
@@ -63,14 +65,7 @@ func (cc *ClientCache) Get(ctx context.Context, org, repo string) (*github.Clien
 		return client, nil
 	}
 
-	// Create token source for this org/repo
-	// Use context.Background() instead of ctx because the token source will be cached
-	// and reused across multiple requests. If we use the request context, it could be
-	// cancelled while the token source is still in the cache, causing future token
-	// refresh attempts to fail with "context cancelled". Alternatively, using a context
-	// without cancel here will cause future requests to inherit a leaky/dirty context
-	// based on previous requests.
-	tokenSource, err := cc.tokenSourceFunc(context.Background(), org, repo)
+	tokenSource, err := cc.tokenSourceForLocked(org, repo)
 	if err != nil {
 		return nil, fmt.Errorf("creating token source: %w", err)
 	}
@@ -97,12 +92,59 @@ func (cc *ClientCache) Get(ctx context.Context, org, repo string) (*github.Clien
 // This allows callers that need raw token sources (e.g., for git clone operations)
 // to reuse the same token source function that backs the client cache.
 func (cc *ClientCache) TokenSourceFor(ctx context.Context, org, repo string) (oauth2.TokenSource, error) {
-	return cc.tokenSourceFunc(ctx, org, repo)
+	key := cc.getKey(org, repo)
+
+	cc.mu.RLock()
+	tokenSource, exists := cc.tokenSources[key]
+	cc.mu.RUnlock()
+
+	if exists {
+		clog.DebugContext(ctx, "Using cached GitHub token source", "org", org, "repo", repo)
+		return tokenSource, nil
+	}
+
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
+	if tokenSource, exists = cc.tokenSources[key]; exists {
+		return tokenSource, nil
+	}
+
+	tokenSource, err := cc.tokenSourceForLocked(org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	clog.InfoContext(ctx, "Created new GitHub token source for repository", "org", org, "repo", repo)
+
+	return tokenSource, nil
 }
 
-// Clear removes all cached clients.
+// tokenSourceForLocked returns the cached token source for org/repo.
+// Callers must hold cc.mu as a write lock.
+func (cc *ClientCache) tokenSourceForLocked(org, repo string) (oauth2.TokenSource, error) {
+	key := cc.getKey(org, repo)
+	if tokenSource, exists := cc.tokenSources[key]; exists {
+		return tokenSource, nil
+	}
+
+	// Use context.Background() because token sources capture the context for
+	// later Token refreshes. Binding a cached source to a request context can
+	// poison the cache after that request is canceled, and can leak request-
+	// scoped deadlines or values into later refreshes.
+	tokenSource, err := cc.tokenSourceFunc(context.Background(), org, repo)
+	if err != nil {
+		return nil, err
+	}
+
+	cc.tokenSources[key] = tokenSource
+	return tokenSource, nil
+}
+
+// Clear removes all cached clients and token sources.
 func (cc *ClientCache) Clear() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	cc.clients = make(map[string]*github.Client)
+	cc.tokenSources = make(map[string]oauth2.TokenSource)
 }
