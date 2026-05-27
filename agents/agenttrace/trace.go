@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chainguard-dev/clog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -104,6 +105,20 @@ type LLMTurn[T any] struct {
 
 	// record accumulates per-turn data appended to trace.Turns on End.
 	record RecordedTurn
+
+	// requestPayload and responsePayload are populated by RecordRequest /
+	// RecordResponse when WithPayloadsEnabled is set. Used by End to emit a
+	// per-span CloudEvent through trace.spanEmitter.
+	requestPayload  []byte
+	responsePayload []byte
+
+	// requestTruncated / responseTruncated record whether preparePayload
+	// shortened the corresponding payload to fit inside maxPayloadBytes.
+	// Either flag set surfaces as driftlessaf.payload.truncated = true on
+	// the span metadata so downstream consumers can distinguish a real
+	// prompt body from a truncated one.
+	requestTruncated  bool
+	responseTruncated bool
 }
 
 // RecordedTurn is the per-turn data captured on a Trace so each LLM turn
@@ -178,6 +193,11 @@ type Trace[T any] struct {
 	mu   sync.Mutex
 	ctx  context.Context
 	span oteltrace.Span
+
+	// spanEmitter, when non-nil, receives a RecordedSpan from LLMTurn.End
+	// for every turn that recorded a prompt payload. Wired by the
+	// CloudEvent-emitting tracer; nil for the default tracer.
+	spanEmitter SpanEmitter
 }
 
 // newTrace creates a new trace for the given prompt. The context must
@@ -456,7 +476,9 @@ func (lt *LLMTurn[T]) Fail(err error) {
 
 // End ends the turn span and restores the trace context to before the turn.
 // It is idempotent: subsequent calls are no-ops. On the first call, it
-// appends the accumulated RecordedTurn to the parent trace's Turns slice.
+// appends the accumulated RecordedTurn to the parent trace's Turns slice
+// and, when a request payload was recorded and the trace has a spanEmitter
+// configured, emits a per-span CloudEvent for the turn.
 func (lt *LLMTurn[T]) End() {
 	lt.once.Do(func() {
 		if lt.span != nil {
@@ -466,6 +488,8 @@ func (lt *LLMTurn[T]) End() {
 		lt.trace.mu.Lock()
 		lt.trace.ctx = lt.prevCtx
 		lt.trace.Turns = append(lt.trace.Turns, lt.record)
+		emitter := lt.trace.spanEmitter
+		emitCtx := lt.trace.ctx
 		lt.trace.mu.Unlock()
 		// Decouple lt.record.Errors from the slice header just appended into
 		// trace.Turns. The contract says "Call before End", but a violation
@@ -475,6 +499,26 @@ func (lt *LLMTurn[T]) End() {
 		// owns no shared array; any post-End append allocates fresh and
 		// writes into a private grave.
 		lt.record.Errors = nil
+
+		if emitter != nil {
+			if span, ok := lt.buildRecordedSpan(); ok {
+				// emitter is expected to be non-blocking and to handle its
+				// own delivery retries (see ceEmittingTracer.emitSpan). The
+				// only way it returns a non-nil error here is a synchronous
+				// pre-flight failure such as ce.SetData rejecting the span
+				// (the bug fixed in #3303142362). Log it at the call site so
+				// silent span loss is observable in Cloud Run logs without
+				// forcing End() to propagate the error — End() is the cleanup
+				// path on a deferred turn and has no useful return channel.
+				if err := emitter(emitCtx, span); err != nil {
+					clog.WarnContext(emitCtx, "agent span emit dropped",
+						"trace_id", lt.trace.ID,
+						"span_id", span.SpanID,
+						"error", err.Error(),
+					)
+				}
+			}
+		}
 	})
 }
 

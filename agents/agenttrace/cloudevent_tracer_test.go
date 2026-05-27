@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	cloudevents "github.com/cloudevents/sdk-go/v2"
@@ -210,5 +211,132 @@ func TestNewBrokerClient_EmptyURL_ReturnsNil(t *testing.T) {
 	client := NewBrokerClient(t.Context(), "")
 	if client != nil {
 		t.Error("expected nil client for empty broker URL")
+	}
+}
+
+// A turn that records a payload while payloads are enabled must produce a
+// distinct per-span CloudEvent (SpanEventType) on the same broker, in
+// addition to the per-trace event emitted at trace completion.
+func TestWithCloudEventEmission_EmitsPerSpanEvent(t *testing.T) {
+	var received []*http.Request
+	var bodies [][]byte
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		received = append(received, r)
+		bodies = append(bodies, body)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := cloudevents.NewClientHTTP(
+		cloudevents.WithTarget(srv.URL),
+		cehttp.WithClient(*srv.Client()),
+	)
+	if err != nil {
+		t.Fatalf("creating test CE client: %v", err)
+	}
+
+	inner := ByCode[string](func(_ *Trace[string]) {})
+	wrapped := WithCloudEventEmission[string](inner, client, "test-reconciler")
+
+	ctx := WithPayloadsEnabled(t.Context(), true)
+	ctx = WithExecutionContext(ctx, ExecutionContext{
+		ReconcilerKey: "pr:owner/repo/42",
+	})
+	ctx = WithTracer[string](ctx, wrapped)
+
+	trace, done := StartTrace[string](ctx, "fix the title")
+	turn := trace.BeginTurn(0, "anthropic", "claude-sonnet-4-7")
+	if err := turn.RecordRequest([]map[string]string{{"role": "user", "content": "fix it"}}); err != nil {
+		t.Fatalf("RecordRequest: %v", err)
+	}
+	if err := turn.RecordResponse(map[string]string{"content": "fixed"}); err != nil {
+		t.Fatalf("RecordResponse: %v", err)
+	}
+	turn.RecordTokens(100, 25)
+	turn.End()
+	done("fixed", nil)
+	drainCE[string](wrapped)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 2 {
+		t.Fatalf("expected 2 CloudEvents (1 span + 1 trace), got %d", len(received))
+	}
+
+	// Find the span event by type header.
+	var spanBody []byte
+	for i, r := range received {
+		if r.Header.Get("Ce-Type") == SpanEventType {
+			spanBody = bodies[i]
+			break
+		}
+	}
+	if spanBody == nil {
+		t.Fatal("no CloudEvent with span type received")
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(spanBody, &decoded); err != nil {
+		t.Fatalf("span body not valid JSON: %v", err)
+	}
+	if got, want := decoded["trace_id"], trace.ID; got != want {
+		t.Errorf("trace_id: got %v, want %v", got, want)
+	}
+	if got, want := decoded["span_id"], trace.ID+"-t0"; got != want {
+		t.Errorf("span_id: got %v, want %v", got, want)
+	}
+	if decoded["prompt_hash"] == "" || decoded["prompt_hash"] == nil {
+		t.Error("prompt_hash missing")
+	}
+}
+
+// When WithPayloadsEnabled is unset, no per-span events should be emitted —
+// only the per-trace event at completion.
+func TestWithCloudEventEmission_NoSpanEventWhenPayloadsDisabled(t *testing.T) {
+	var typeCounts = map[string]int{}
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		typeCounts[r.Header.Get("Ce-Type")]++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client, err := cloudevents.NewClientHTTP(
+		cloudevents.WithTarget(srv.URL),
+		cehttp.WithClient(*srv.Client()),
+	)
+	if err != nil {
+		t.Fatalf("creating test CE client: %v", err)
+	}
+
+	inner := ByCode[string](func(_ *Trace[string]) {})
+	wrapped := WithCloudEventEmission[string](inner, client, "test-reconciler")
+
+	ctx := WithTracer[string](t.Context(), wrapped)
+	trace, done := StartTrace[string](ctx, "prompt")
+	turn := trace.BeginTurn(0, "anthropic", "claude-sonnet-4-7")
+	// RecordRequest is a no-op since payloads are not enabled.
+	if err := turn.RecordRequest([]map[string]string{{"role": "user", "content": "hi"}}); err != nil {
+		t.Fatalf("RecordRequest: %v", err)
+	}
+	turn.End()
+	done("done", nil)
+	drainCE[string](wrapped)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := typeCounts[SpanEventType]; got != 0 {
+		t.Errorf("span events with payloads disabled: got %d, want 0", got)
+	}
+	if got := typeCounts[EventType]; got != 1 {
+		t.Errorf("trace events: got %d, want 1", got)
 	}
 }

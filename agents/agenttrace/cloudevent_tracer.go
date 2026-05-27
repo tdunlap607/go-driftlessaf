@@ -59,7 +59,53 @@ func WithCloudEventEmission[T any](inner Tracer[T], client cloudevents.Client, s
 }
 
 func (t *ceEmittingTracer[T]) NewTrace(ctx context.Context, prompt string, opts ...StartTraceOption) *Trace[T] {
-	return t.inner.NewTrace(ctx, prompt, opts...)
+	trace := t.inner.NewTrace(ctx, prompt, opts...)
+	// Wire the per-span emitter so LLMTurn.End ships a per-turn CloudEvent
+	// for any turn that recorded a payload. Gating already happens in
+	// RecordRequest/RecordResponse — if payloads were never recorded, the
+	// emitter is invoked with nothing and short-circuits.
+	trace.spanEmitter = t.emitSpan
+	return trace
+}
+
+// emitSpan sends a per-turn CloudEvent through the same broker as the
+// per-trace event. Uses the same bounded errgroup as RecordTrace; the
+// caller's End() returns immediately under normal load but blocks on
+// eg.Go once the in-flight cap (ceMaxInflight) is reached. Multi-turn
+// traces multiply pressure on the cap relative to the per-trace-only
+// design.
+func (t *ceEmittingTracer[T]) emitSpan(ctx context.Context, span RecordedSpan) error {
+	ce := cloudevents.NewEvent()
+	ce.SetID(span.SpanID)
+	ce.SetType(SpanEventType)
+	ce.SetSource(t.source)
+	ce.SetSubject(span.TraceID)
+	ce.SetTime(span.RecordedAt)
+
+	if err := ce.SetData(cloudevents.ApplicationJSON, span); err != nil {
+		clog.ErrorContext(ctx, "Failed to set span CloudEvent data",
+			"trace_id", span.TraceID,
+			"span_id", span.SpanID,
+			"error", err,
+		)
+		return err
+	}
+
+	t.eg.Go(func() error {
+		sendCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ceSendTimeout)
+		defer cancel()
+
+		rctx := cloudevents.ContextWithRetriesExponentialBackoff(sendCtx, ceRetryDelay, ceMaxRetry)
+		if result := t.client.Send(rctx, ce); cloudevents.IsUndelivered(result) || cloudevents.IsNACK(result) {
+			clog.ErrorContext(ctx, "Failed to deliver agent span event",
+				"trace_id", span.TraceID,
+				"span_id", span.SpanID,
+				"error", result,
+			)
+		}
+		return nil
+	})
+	return nil
 }
 
 func (t *ceEmittingTracer[T]) RecordTrace(trace *Trace[T]) {
