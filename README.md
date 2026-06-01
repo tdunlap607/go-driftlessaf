@@ -39,7 +39,7 @@ go get chainguard.dev/driftlessaf@latest
 
 ## Usage
 
-See the package documentation for examples and API reference.
+See the package documentation for examples and the API reference.
 
 ## License
 
